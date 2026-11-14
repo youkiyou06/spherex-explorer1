@@ -1,0 +1,130 @@
+import os
+import requests
+from astropy.coordinates import SkyCoord
+import astropy.units as u
+from astropy.io import fits
+from astropy.visualization import ZScaleInterval
+from astroquery.ipac.irsa import Irsa
+import matplotlib.pyplot as plt
+
+
+def telecharger_images_mouvement(ra_deg, dec_deg, taille_deg=0.05, ecart_jours_min=1.0, dossier_sortie="spherex_mouvement"):
+    """
+    Recherche et télécharge deux images SPHEREx aux mêmes coordonnées et dans la même bande,
+    prises à deux époques différentes pour détecter des objets en mouvement.
+    """
+    cible = SkyCoord(ra=ra_deg * u.deg, dec=dec_deg * u.deg)
+    rayon = (taille_deg / 2.0) * u.deg
+    
+    print(f"1. Recherche sur IRSA pour RA={ra_deg}, Dec={dec_deg}...")
+    try:
+        resultats = Irsa.query_sia(
+            pos=(cible, rayon),
+            collection=["spherex_dr1", "spherex_qr3"]
+        )
+    except Exception as e:
+        print(f"Erreur lors de la requête vers IRSA : {e}")
+        return []
+    
+    if len(resultats) == 0:
+        print("Aucune image SPHEREx trouvée à ces coordonnées.")
+        return []
+
+    print(f"   -> {len(resultats)} observations trouvées au total.")
+
+    # 2. Regrouper les observations par bande spectrale (détecteur)
+    bandes = {}
+    for row in resultats:
+        bande = str(row["energy_bandpassname"]) if "energy_bandpassname" in row.colnames else "default"
+        t_mjd = float(row["t_min"]) if "t_min" in row.colnames else 0.0
+        
+        if bande not in bandes:
+            bandes[bande] = []
+        bandes[bande].append((t_mjd, row))
+
+    # 3. Trouver une bande ayant au moins 2 observations séparées dans le temps
+    paire_selectionnee = None
+    bande_choisie = None
+
+    for bande, obs_list in bandes.items():
+        if len(obs_list) < 2:
+            continue
+            
+        # Trier les observations par date (t_mjd) de la plus ancienne à la plus récente
+        obs_list.sort(key=lambda x: x[0])
+        
+        t_debut, row_debut = obs_list[0]
+        t_fin, row_fin = obs_list[-1]
+        
+        if (t_fin - t_debut) >= ecart_jours_min:
+            paire_selectionnee = [(t_debut, row_debut), (t_fin, row_fin)]
+            bande_choisie = bande
+            break
+
+    if not paire_selectionnee:
+        print(f"Aucune paire d'images trouvée avec un écart d'au moins {ecart_jours_min} jour(s).")
+        print("Astuce : Diminuez 'ecart_jours_min' (ex: 0.05 pour ~1 heure) ou changez de coordonnées.")
+        return []
+
+    t1 = paire_selectionnee[0][0]
+    t2 = paire_selectionnee[1][0]
+    print(f"2. Paire trouvée dans la bande {bande_choisie} :")
+    print(f"   -> Époque 1 (MJD) : {t1:.4f}")
+    print(f"   -> Époque 2 (MJD) : {t2:.4f}")
+    print(f"   -> Écart temporel   : {t2 - t1:.2f} jours")
+
+    # 4. Télécharger les deux découpes (cutouts)
+    os.makedirs(dossier_sortie, exist_ok=True)
+    fichiers_fits = []
+
+    for idx, (t_mjd, row) in enumerate(paire_selectionnee, start=1):
+        url_base = str(row["access_url"])
+        # Gérer le séparateur URL (? ou &) au cas où access_url contient déjà des paramètres
+        separateur = "&" if "?" in url_base else "?"
+        url_cutout = f"{url_base}{separateur}center={ra_deg},{dec_deg}&size={taille_deg}"
+        
+        nom_base = f"epoque{idx}_{bande_choisie}_mjd{int(t_mjd)}"
+        chemin_fits = os.path.join(dossier_sortie, f"{nom_base}.fits")
+        chemin_png = os.path.join(dossier_sortie, f"{nom_base}.png")
+        
+        print(f"3. Téléchargement de l'époque {idx}...")
+        reponse = requests.get(url_cutout)
+        
+        if reponse.status_code == 200:
+            with open(chemin_fits, "wb") as f:
+                f.write(reponse.content)
+                
+            # Sauvegarde en PNG pour vérification visuelle
+            with fits.open(chemin_fits) as hdul:
+                data = hdul["IMAGE"].data if "IMAGE" in hdul else hdul[1].data
+                vmin, vmax = ZScaleInterval().get_limits(data)
+                plt.imsave(chemin_png, data, cmap="gray", vmin=vmin, vmax=vmax, origin="lower")
+                
+            fichiers_fits.append(chemin_fits)
+            print(f"   -> OK : {chemin_fits} et {chemin_png}")
+        else:
+            print(f"   -> Erreur HTTP {reponse.status_code} lors du téléchargement.")
+
+    return fichiers_fits
+
+
+# =====================================================================
+# LANCEMENT DU SCRIPT
+# =====================================================================
+if __name__ == "__main__":
+    # Exemple sur l'écliptique (zone de passage des planètes et astéroïdes)
+    RA_CIBLE = 180.0
+    DEC_CIBLE = 0.0
+    
+    # On demande un écart minimum de 0.1 jour (~2h20), suffisant pour voir un astéroïde bouger
+    fichiers = telecharger_images_mouvement(
+        ra_deg=RA_CIBLE,
+        dec_deg=DEC_CIBLE,
+        taille_deg=0.08,
+        ecart_jours_min=0.1
+    )
+    
+    if len(fichiers) == 2:
+        print("\nSuccès ! Voici les 2 fichiers à passer à votre fonction de différence :")
+        print("Image 1 :", fichiers[0])
+        print("Image 2 :", fichiers[1])
