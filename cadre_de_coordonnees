@@ -1,0 +1,119 @@
+from astropy.coordinates import SkyCoord, get_sun, get_moon
+from astropy.time import Time
+import astropy.units as u
+
+
+def _format_deg(value: float | None) -> str:
+    if value is None:
+        return "N/A"
+    return f"{float(value):.4f}°"
+
+
+def _format_hms_deg(value_deg: float) -> str:
+    # Conversion RA en h m s
+    ra_hours = value_deg / 15.0
+    h = int(ra_hours)
+    m = int((ra_hours - h) * 60)
+    s = ((ra_hours - h) * 60 - m) * 60
+    return f"{h:02d}h {m:02d}m {s:05.2f}s"
+
+
+def render_coordinate_panel(ra_deg: float, dec_deg: float) -> None:
+    st.markdown("""
+    <style>
+    .coord-card {
+        background: linear-gradient(180deg, rgba(16, 34, 61, 0.95), rgba(11, 22, 39, 0.95));
+        border: 1px solid #2E5A86;
+        border-radius: 14px;
+        padding: 18px 20px;
+        margin: 12px 0 18px 0;
+    }
+    .coord-title {
+        font-size: 18px;
+        font-weight: 700;
+        color: #EAF6FF;
+        margin-bottom: 10px;
+    }
+    .coord-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+        gap: 12px;
+    }
+    .coord-box {
+        background: rgba(255,255,255,0.03);
+        border: 1px solid rgba(172, 209, 255, 0.18);
+        border-radius: 10px;
+        padding: 10px 12px;
+    }
+    .coord-label {
+        font-size: 12px;
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+        color: #9FC4EA;
+    }
+    .coord-value {
+        margin-top: 4px;
+        font-size: 16px;
+        font-weight: 600;
+        color: white;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+
+    now = Time.now()
+    sun = get_sun(now)
+    moon = get_moon(now)
+
+    target = SkyCoord(ra=ra_deg * u.deg, dec=dec_deg * u.deg, frame="icrs")
+
+    st.markdown(
+        f"""
+        <div class="coord-card">
+            <div class="coord-title">📍 Coordonnées utiles</div>
+            <div class="coord-grid">
+                <div class="coord-box">
+                    <div class="coord-label">Cible choisie</div>
+                    <div class="coord-value">RA: {_format_hms_deg(target.ra.deg)}<br>Dec: {_format_deg(target.dec.deg)}</div>
+                </div>
+                <div class="coord-box">
+                    <div class="coord-label">Soleil</div>
+                    <div class="coord-value">RA: {_format_hms_deg(sun.ra.deg)}<br>Dec: {_format_deg(sun.dec.deg)}</div>
+                </div>
+                <div class="coord-box">
+                    <div class="coord-label">Lune</div>
+                    <div class="coord-value">RA: {_format_hms_deg(moon.ra.deg)}<br>Dec: {_format_deg(moon.dec.deg)}</div>
+                </div>
+                <div class="coord-box">
+                    <div class="coord-label">Date / Heure</div>
+                    <div class="coord-value">{now.iso}</div>
+                </div>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+# Appel dans la logique de recherche
+if search:
+    ...
+    try:
+        with st.spinner("Searching the SPHEREx archive..."):
+            observations = search_observations(
+                ra_deg=ra,
+                dec_deg=dec,
+                radius_deg=radius,
+                limit=100
+            )
+        st.session_state.observations = observations
+        st.session_state.search_done = True
+    except Exception as error:
+        st.session_state.search_error = str(error)
+        st.error(f"Archive search failed: {error}")
+
+
+# Avant l'affichage des résultats, ou juste avant l'image
+if st.session_state.search_done:
+    observations = st.session_state.observations
+    if observations:
+        render_coordinate_panel(ra, dec)
