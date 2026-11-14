@@ -1,43 +1,158 @@
+
+from pathlib import Path
+
+import numpy as np
+import requests
 from astroquery.ipac.irsa import Irsa
 from astropy.coordinates import SkyCoord
+from astropy.io import fits
 import astropy.units as u
+from reproject import reproject_interp
 
-def get_spherex_urls(ra_deg, dec_deg, radius_deg=1.0, collections=("spherex_dr1", "spherex_qr3")):
-    """
-    Query SPHEREx SIA catalogs around a sky position and return access URLs.
-    """
-    position = SkyCoord(ra=ra_deg * u.deg, dec=dec_deg * u.deg)
 
-    all_results = {}
+# Dossier "data" créé à côté de ce fichier.
+DOSSIER_DATA = Path(__file__).resolve().parent / "data"
 
-    for collection in collections:
-        try:
-            table = Irsa.query_sia(
-                pos=(position, radius_deg * u.deg),
-                collection=collection
-            )
 
-            if len(table) == 0:
-                print(f"No results found for {collection}.")
-                all_results[collection] = []
-                continue
+def rechercher(collection, position, rayon):
+    table = Irsa.query_sia(
+        pos=(position, rayon),
+        collection=collection,
+    )
 
-            urls = [row["access_url"] for row in table]
-            all_results[collection] = urls
+    print(f"\n{collection} : {len(table)} résultat(s)")
+    print("Colonnes disponibles :", table.colnames)
 
-            print(f"\n{collection}:")
-            for url in urls[:5]:
-                print(url)
+    colonnes = [
+        nom for nom in table.colnames
+        if nom.lower() in {
+            "access_url", "obs_id", "s_ra", "s_dec",
+            "band", "filter", "time", "t_min", "t_max", "mjd",
+        }
+    ]
 
-            if len(urls) > 5:
-                print(f"... and {len(urls) - 5} more URL(s)")
+    for i, ligne in enumerate(table):
+        if "access_url" not in table.colnames:
+            break
 
-        except Exception as e:
-            print(f"Failed to query {collection}: {e}")
-            all_results[collection] = []
+        infos = {nom: str(ligne[nom]) for nom in colonnes}
+        print(f"\nIndex {i} : {infos}")
 
-    return all_results
+    return table
+
+
+def telecharger(table, index, chemin):
+    url = str(table[index]["access_url"]).strip()
+
+    if not url or url.lower() == "nan":
+        raise ValueError(f"Pas d'URL valide pour l'index {index}.")
+
+    print(f"\nTéléchargement de {url}")
+    reponse = requests.get(url, timeout=180)
+    reponse.raise_for_status()
+
+    chemin.parent.mkdir(parents=True, exist_ok=True)
+    chemin.write_bytes(reponse.content)
+
+    # Vérifie que le fichier téléchargé est lisible comme FITS.
+    with fits.open(chemin) as hdus:
+        hdus.verify("exception")
+
+    print(f"Fichier enregistré : {chemin}")
+
+
+def lire_image_fits(chemin):
+    with fits.open(chemin) as hdus:
+        for hdu in hdus:
+            if hdu.data is not None and np.ndim(hdu.data) == 2:
+                image = np.array(hdu.data, dtype=float)
+                wcs = hdu.header.copy()
+                return image, wcs
+
+    raise ValueError(f"Aucune image 2D trouvée dans {chemin}.")
+
+
+def comparer_images(fichier1, fichier2):
+    image1, entete1 = lire_image_fits(fichier1)
+    image2, entete2 = lire_image_fits(fichier2)
+
+    # Aligne la deuxième image sur la grille céleste de la première.
+    image2_alignee, couverture = reproject_interp(
+        (image2, entete2),
+        entete1,
+        shape_out=image1.shape,
+    )
+
+    valide = (
+        np.isfinite(image1)
+        & np.isfinite(image2_alignee)
+        & (couverture > 0.5)
+    )
+
+    if not np.any(valide):
+        raise ValueError("Aucune zone commune valide entre les deux images.")
+
+    difference = np.full(image1.shape, np.nan)
+    difference[valide] = image2_alignee[valide] - image1[valide]
+
+    valeurs = difference[valide]
+    mediane = np.median(valeurs)
+    sigma = 1.4826 * np.median(np.abs(valeurs - mediane))
+
+    if not np.isfinite(sigma) or sigma == 0:
+        raise ValueError("Impossible d'estimer le bruit de l'image différence.")
+
+    y, x = np.where(
+        valide & (np.abs(difference - mediane) > 5 * sigma)
+    )
+
+    fichier_difference = DOSSIER_DATA / "difference.fits"
+    fits.PrimaryHDU(
+        data=difference,
+        header=fits.Header(entete1),
+    ).writeto(fichier_difference, overwrite=True)
+
+    fichier_candidats = DOSSIER_DATA / "pixels_candidats.csv"
+    np.savetxt(
+        fichier_candidats,
+        np.column_stack((x, y, difference[y, x])),
+        delimiter=",",
+        header="x,y,difference",
+        comments="",
+    )
+
+    print(f"\n{len(x)} pixels dépassent le seuil de 5 sigma.")
+    print(f"Image différence : {fichier_difference}")
+    print(f"Pixels candidats : {fichier_candidats}")
+    print("Ces pixels sont des candidats à examiner, pas une détection confirmée.")
+
+
+def main():
+    position = SkyCoord(ra=10 * u.deg, dec=41 * u.deg)
+    rayon = 1.0 * u.deg
+
+    dr1 = rechercher("spherex_dr1", position, rayon)
+    qr3 = rechercher("spherex_qr3", position, rayon)
+
+    if len(dr1) == 0 or len(qr3) == 0:
+        raise RuntimeError("Aucun résultat trouvé dans l'une des collections.")
+
+    index_dr1 = int(input("\nIndex du produit DR1 à télécharger : "))
+    index_qr3 = int(input("Index du produit QR3 à télécharger : "))
+
+    if not 0 <= index_dr1 < len(dr1):
+        raise IndexError("Index DR1 invalide.")
+    if not 0 <= index_qr3 < len(qr3):
+        raise IndexError("Index QR3 invalide.")
+
+    fichier1 = DOSSIER_DATA / "photo1.fits"
+    fichier2 = DOSSIER_DATA / "photo2.fits"
+
+    telecharger(dr1, index_dr1, fichier1)
+    telecharger(qr3, index_qr3, fichier2)
+    comparer_images(fichier1, fichier2)
 
 
 if __name__ == "__main__":
-    results = get_spherex_urls(ra_deg=10, dec_deg=41, radius_deg=1.0)
+    main()
+Bloc collé, 1 au total
