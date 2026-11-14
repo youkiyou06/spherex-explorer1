@@ -1,19 +1,12 @@
 
+import streamlit as st
 import json
 import math
 from pathlib import Path
 
-import streamlit as st
-import streamlit.components.v1 as components
-
-
-# ============================================================
-# 1. CONFIGURATION
-# ============================================================
-
-BASE_DIR = Path(__file__).parent
-JSON_FILE = BASE_DIR / "observations.json"
-IMAGES_DIR = BASE_DIR / "images"
+# =========================================================
+# CONFIGURATION
+# =========================================================
 
 st.set_page_config(
     page_title="SPHEREx Explorer",
@@ -21,362 +14,110 @@ st.set_page_config(
     initial_sidebar_state="collapsed"
 )
 
+BASE_DIR = Path(__file__).parent
+JSON_FILE = BASE_DIR / "observations.json"
+IMAGE_DIR = BASE_DIR / "images"
 
-# ============================================================
-# 2. SESSION STATE
-# ============================================================
-
-defaults = {
-    "mode": "home",
-    "search_done": False,
-    "results": [],
-    "timeline_index": 0
-}
-
-for key, value in defaults.items():
-    if key not in st.session_state:
-        st.session_state[key] = value
-
-
-# ============================================================
-# 3. GLOBAL DESIGN
-# ============================================================
+# =========================================================
+# DESIGN
+# =========================================================
 
 st.markdown("""
 <style>
+    html, body, [data-testid="stAppViewContainer"] {
+        background-color: #07152f !important;
+        color: white !important;
+    }
 
-/* MAIN NAVY BACKGROUND */
+    [data-testid="stHeader"] {
+        background-color: #07152f !important;
+    }
 
-html, body, #root,
-[data-testid="stApp"],
-[data-testid="stAppViewContainer"],
-[data-testid="stMain"],
-[data-testid="stMainBlockContainer"] {
-    background: #06162B !important;
-    color: #FFFFFF !important;
-}
+    [data-testid="stToolbar"] {
+        visibility: hidden;
+    }
 
-/* REMOVE STREAMLIT HEADER */
+    .block-container {
+        padding-top: 2rem;
+        max-width: 1450px;
+    }
 
-header,
-[data-testid="stHeader"],
-[data-testid="stToolbar"],
-[data-testid="stDecoration"],
-#MainMenu,
-footer {
-    display: none !important;
-}
+    h1, h2, h3, p, label {
+        color: white !important;
+    }
 
-/* CONTENT LAYER */
+    .main-title {
+        text-align: center;
+        font-size: 42px;
+        font-weight: 800;
+        letter-spacing: 2px;
+        color: white;
+        margin-bottom: 25px;
+    }
 
-[data-testid="stMainBlockContainer"] {
-    max-width: 1200px !important;
-    padding-top: 1.5rem !important;
-    position: relative;
-    z-index: 2;
-}
+    .intro-box {
+        background: #102b55;
+        border: 1px solid #e8c547;
+        border-radius: 15px;
+        padding: 25px 35px;
+        text-align: center;
+        font-size: 19px;
+        line-height: 1.6;
+        margin: 0 auto 35px auto;
+        max-width: 1000px;
+    }
 
-/* MAKE STREAMLIT CONTENT TRANSPARENT */
+    div.stButton > button {
+        background-color: #102b55;
+        color: white;
+        border: 2px solid #e8c547;
+        border-radius: 10px;
+        height: 58px;
+        font-size: 15px;
+        font-weight: 700;
+        width: 100%;
+        transition: 0.2s;
+    }
 
-[data-testid="stMain"],
-[data-testid="stMainBlockContainer"],
-[data-testid="stVerticalBlock"] {
-    background-color: transparent !important;
-}
+    div.stButton > button:hover {
+        background-color: #e8c547;
+        color: #07152f;
+        border-color: #e8c547;
+    }
 
-/* HOME TITLE */
+    div[data-testid="stTextInput"] input,
+    div[data-testid="stNumberInput"] input {
+        background-color: #102b55;
+        color: white;
+        border: 1px solid #e8c547;
+    }
 
-.home-title {
-    text-align: center;
-    font-family: Arial, sans-serif;
-    font-size: clamp(40px, 5vw, 62px);
-    font-weight: 850;
-    letter-spacing: 2px;
-    color: white;
-    margin-top: 35px;
-    margin-bottom: 55px;
-    text-shadow: 0 0 22px rgba(80, 160, 255, 0.3);
-}
+    .info-box {
+        background: #102b55;
+        border-left: 4px solid #e8c547;
+        border-radius: 8px;
+        padding: 18px;
+        margin: 15px 0;
+        color: white;
+        line-height: 1.6;
+    }
 
-/* EXPLANATION BOX */
-
-.explanation-box {
-    max-width: 950px;
-    margin: 0 auto 65px auto;
-    padding: 42px 48px;
-    text-align: center;
-    background: #091F3D;
-    border: 1px solid #31577F;
-    border-radius: 20px;
-    box-shadow: 0 10px 35px rgba(0,0,0,0.25);
-}
-
-.explanation-box p {
-    font-family: Arial, sans-serif;
-    font-size: 23px;
-    font-weight: 600;
-    line-height: 1.65;
-    color: white !important;
-    margin: 0;
-}
-
-/* BACKGROUND DRAWINGS */
-
-.space-decorations {
-    position: fixed;
-    inset: 0;
-    width: 100vw;
-    height: 100vh;
-    pointer-events: none !important;
-    z-index: 0;
-    overflow: hidden;
-}
-
-.space-drawing {
-    position: absolute;
-    width: 120px;
-    height: 120px;
-    opacity: 0.78;
-}
-
-.space-drawing svg {
-    width: 100%;
-    height: 100%;
-}
-
-.space-drawing path,
-.space-drawing circle,
-.space-drawing ellipse,
-.space-drawing rect {
-    fill: none;
-    stroke: #FFD34E;
-    stroke-width: 2.2;
-    stroke-linecap: round;
-    stroke-linejoin: round;
-}
-
-.drawing-telescope {
-    top: 25%;
-    left: 4%;
-    transform: rotate(-12deg);
-}
-
-.drawing-saturn {
-    top: 34%;
-    right: 4%;
-}
-
-.drawing-satellite {
-    top: 72%;
-    left: 6%;
-    transform: rotate(-12deg);
-}
-
-.drawing-rocket {
-    top: 70%;
-    right: 6%;
-    transform: rotate(35deg);
-}
-
-/* ALL BUTTONS */
-
-.stButton > button {
-    width: 100%;
-    min-height: 65px;
-    border-radius: 12px;
-    border: 1px solid #4779A5 !important;
-    background: #12385F !important;
-    color: #FFFFFF !important;
-    font-size: 17px;
-    font-weight: 750;
-    transition: 0.2s ease;
-}
-
-.stButton > button:hover {
-    border-color: #FFD34E !important;
-    background: #1B4C78 !important;
-    color: #FFD34E !important;
-}
-
-/* FORM SEARCH BUTTON */
-
-.stFormSubmitButton > button,
-[data-testid="stFormSubmitButton"] button {
-    background: #174875 !important;
-    color: #FFFFFF !important;
-    border: 1px solid #FFD34E !important;
-    border-radius: 12px !important;
-    min-height: 58px !important;
-    font-size: 17px !important;
-    font-weight: 800 !important;
-}
-
-.stFormSubmitButton > button:hover,
-[data-testid="stFormSubmitButton"] button:hover {
-    background: #286397 !important;
-    color: #FFD34E !important;
-}
-
-/* INPUTS */
-
-.stTextInput input,
-.stNumberInput input {
-    background-color: #10243B !important;
-    color: white !important;
-    border: 1px solid #345779 !important;
-    border-radius: 9px !important;
-}
-
-.stTextInput label,
-.stNumberInput label,
-.stSelectbox label {
-    color: white !important;
-    font-weight: 600;
-}
-
-.stNumberInput button {
-    color: white !important;
-}
-
-/* FORMS */
-
-[data-testid="stForm"] {
-    background: #091D34 !important;
-    border: 1px solid #294968;
-    border-radius: 16px;
-    padding: 25px;
-}
-
-/* INFORMATION PANELS */
-
-.info-panel {
-    background: #0C2641;
-    border: 1px solid #294968;
-    border-radius: 13px;
-    padding: 18px;
-    margin: 12px 0;
-    color: white;
-}
-
-/* FOOTER */
-
-.footer {
-    text-align: center;
-    color: #8DA8C5;
-    font-size: 13px;
-    margin-top: 55px;
-    padding: 20px;
-}
-
-/* MOBILE */
-
-@media (max-width: 700px) {
-
-    .home-title {
-        font-size: 38px;
+    .section-title {
+        color: #e8c547;
+        font-size: 23px;
+        font-weight: 700;
         margin-top: 20px;
-        margin-bottom: 35px;
+        margin-bottom: 15px;
     }
-
-    .explanation-box {
-        padding: 25px 20px;
-        margin-bottom: 45px;
-    }
-
-    .explanation-box p {
-        font-size: 18px;
-    }
-
-    .space-drawing {
-        width: 65px;
-        height: 65px;
-    }
-
-    .drawing-telescope,
-    .drawing-satellite {
-        left: 1%;
-    }
-
-    .drawing-saturn,
-    .drawing-rocket {
-        right: 1%;
-    }
-}
-
 </style>
 """, unsafe_allow_html=True)
 
 
-# ============================================================
-# 4. SPACE BACKGROUND DRAWINGS
-# ============================================================
+# =========================================================
+# OBSERVATIONS
+# =========================================================
 
-def show_decorations():
-
-    st.markdown("""
-    <div class="space-decorations">
-
-        <div class="space-drawing drawing-telescope">
-            <svg viewBox="0 0 120 120">
-                <path d="M24 28 L78 12 L88 36 L34 52 Z"/>
-                <path d="M78 12 L91 8 L102 32 L88 36"/>
-                <path d="M34 52 L43 68"/>
-                <path d="M55 46 L75 88"/>
-                <path d="M75 88 L45 111"/>
-                <path d="M75 88 L91 111"/>
-                <path d="M75 88 L75 115"/>
-                <path d="M40 69 L61 61"/>
-            </svg>
-        </div>
-
-        <div class="space-drawing drawing-saturn">
-            <svg viewBox="0 0 120 120">
-                <ellipse cx="60" cy="60" rx="23" ry="23"/>
-                <ellipse cx="60" cy="60" rx="53" ry="15"
-                         transform="rotate(-20 60 60)"/>
-                <path d="M10 75 Q60 92 109 44"/>
-                <path d="M38 43 Q60 28 79 44"/>
-                <path d="M42 76 Q61 88 78 72"/>
-            </svg>
-        </div>
-
-        <div class="space-drawing drawing-satellite">
-            <svg viewBox="0 0 120 120">
-                <rect x="45" y="43" width="30" height="30"
-                      transform="rotate(35 60 58)"/>
-                <rect x="5" y="42" width="35" height="27"
-                      transform="rotate(35 22 55)"/>
-                <rect x="80" y="42" width="35" height="27"
-                      transform="rotate(35 97 55)"/>
-                <path d="M54 43 L65 22 L75 27 L75 48"/>
-                <path d="M60 73 L48 93"/>
-                <path d="M48 93 L35 100"/>
-                <circle cx="62" cy="57" r="5"/>
-            </svg>
-        </div>
-
-        <div class="space-drawing drawing-rocket">
-            <svg viewBox="0 0 120 120">
-                <path d="M60 8 Q89 35 72 77 L60 91 L48 77 Q31 35 60 8 Z"/>
-                <circle cx="60" cy="44" r="9"/>
-                <path d="M48 69 L27 83 L34 55"/>
-                <path d="M72 69 L93 83 L86 55"/>
-                <path d="M51 82 Q46 103 60 115 Q74 103 69 82"/>
-                <path d="M55 88 L60 107 L65 88"/>
-            </svg>
-        </div>
-
-    </div>
-    """, unsafe_allow_html=True)
-
-
-# ============================================================
-# 5. LOAD OBSERVATIONS
-# ============================================================
-
-@st.cache_data
 def load_observations():
-
     if not JSON_FILE.exists():
         return []
 
@@ -384,742 +125,253 @@ def load_observations():
         with open(JSON_FILE, "r", encoding="utf-8") as file:
             data = json.load(file)
 
-        observations = data.get("observations", [])
+        return data.get("observations", [])
 
-        return [
-            obs for obs in observations
-            if all(
-                key in obs
-                for key in ["filename", "ra_deg", "dec_deg", "date"]
-            )
-        ]
-
-    except (json.JSONDecodeError, OSError):
+    except Exception as error:
+        st.error(f"Unable to read observations.json: {error}")
         return []
 
 
-# ============================================================
-# 6. ANGULAR DISTANCE
-# ============================================================
+def angular_distance(ra1, dec1, ra2, dec2):
+    """Calculate angular distance between two celestial positions."""
 
-def angular_separation(ra1, dec1, ra2, dec2):
-
-    ra1 = math.radians(float(ra1))
-    dec1 = math.radians(float(dec1))
-    ra2 = math.radians(float(ra2))
-    dec2 = math.radians(float(dec2))
+    ra1 = math.radians(ra1)
+    dec1 = math.radians(dec1)
+    ra2 = math.radians(ra2)
+    dec2 = math.radians(dec2)
 
     cos_angle = (
         math.sin(dec1) * math.sin(dec2)
-        + math.cos(dec1) * math.cos(dec2)
-        * math.cos(ra1 - ra2)
+        + math.cos(dec1) * math.cos(dec2) * math.cos(ra1 - ra2)
     )
 
-    cos_angle = max(-1.0, min(1.0, cos_angle))
+    cos_angle = max(-1, min(1, cos_angle))
 
     return math.degrees(math.acos(cos_angle))
 
 
-# ============================================================
-# 7. SEARCH OBSERVATIONS
-# ============================================================
-
 def search_observations(ra, dec, radius):
-
     observations = load_observations()
     results = []
 
     for obs in observations:
-
         try:
-            distance = angular_separation(
+            distance = angular_distance(
                 ra,
                 dec,
-                obs["ra_deg"],
-                obs["dec_deg"]
+                float(obs["ra_deg"]),
+                float(obs["dec_deg"])
             )
 
             if distance <= radius:
+                result = obs.copy()
+                result["distance"] = distance
+                results.append(result)
 
-                image_path = IMAGES_DIR / obs["filename"]
-
-                if image_path.is_file():
-
-                    result = obs.copy()
-                    result["distance"] = distance
-                    result["image_path"] = str(image_path)
-
-                    results.append(result)
-
-        except (ValueError, TypeError, KeyError):
+        except (KeyError, ValueError, TypeError):
             continue
 
-    results.sort(key=lambda item: str(item["date"]))
+    return sorted(results, key=lambda item: item.get("date", ""))
 
-    return results
 
+# =========================================================
+# NAVIGATION
+# =========================================================
 
-# ============================================================
-# 8. NAVIGATION
-# ============================================================
+if "page" not in st.session_state:
+    st.session_state.page = "home"
 
-def back_to_home():
 
-    st.session_state.mode = "home"
-    st.session_state.search_done = False
-    st.session_state.results = []
-    st.session_state.timeline_index = 0
+def go_home():
+    st.session_state.page = "home"
 
-    st.rerun()
 
+# =========================================================
+# HOME PAGE
+# =========================================================
 
-def page_header(title):
+if st.session_state.page == "home":
 
-    col1, col2 = st.columns([5, 1])
-
-    with col1:
-        st.markdown(f"## {title}")
-
-    with col2:
-        if st.button("HOME", key=f"home_{title}"):
-            back_to_home()
-
-
-# ============================================================
-# 9. COORDINATE SEARCH MODE
-# ============================================================
-
-def coordinate_search_mode():
-
-    page_header("Coordinate Search")
-
-    st.markdown("""
-    Explore observations around a specific position in the sky.
-
-    Enter the celestial coordinates and choose a search radius.
-    """)
-
-    st.markdown("### Enter your coordinates")
-
-    with st.form("coordinate_search_form"):
-
-        col1, col2 = st.columns(2)
-
-        with col1:
-            ra = st.number_input(
-                "Right Ascension (RA) — degrees",
-                min_value=0.0,
-                max_value=360.0,
-                value=180.0,
-                step=0.1,
-                format="%.4f"
-            )
-
-        with col2:
-            dec = st.number_input(
-                "Declination (DEC) — degrees",
-                min_value=-90.0,
-                max_value=90.0,
-                value=0.0,
-                step=0.1,
-                format="%.4f"
-            )
-
-        radius = st.number_input(
-            "Search radius — degrees",
-            min_value=0.01,
-            max_value=180.0,
-            value=5.0,
-            step=0.5,
-            format="%.2f"
-        )
-
-        submitted = st.form_submit_button(
-            "SEARCH THE SKY",
-            use_container_width=True
-        )
-
-    if submitted:
-
-        st.session_state.results = search_observations(
-            ra,
-            dec,
-            radius
-        )
-
-        st.session_state.search_done = True
-        st.session_state.timeline_index = 0
-
-    if st.session_state.search_done:
-
-        results = st.session_state.results
-
-        st.markdown("---")
-
-        if not results:
-            st.warning(
-                "No matching images were found in the local observation database. "
-                "Try another position or a larger radius."
-            )
-            return
-
-        st.success(f"{len(results)} observation(s) found!")
-
-        st.markdown("### Observation timeline")
-
-        if len(results) > 1:
-
-            current_index = st.session_state.timeline_index
-
-            col_prev, col_info, col_next = st.columns([1, 3, 1])
-
-            with col_prev:
-                if st.button(
-                    "PREVIOUS",
-                    disabled=current_index == 0,
-                    use_container_width=True
-                ):
-                    st.session_state.timeline_index -= 1
-                    st.rerun()
-
-            with col_info:
-                st.markdown(
-                    f"<p style='text-align:center;'>"
-                    f"Observation {current_index + 1} / {len(results)}"
-                    f"</p>",
-                    unsafe_allow_html=True
-                )
-
-            with col_next:
-                if st.button(
-                    "NEXT",
-                    disabled=current_index >= len(results) - 1,
-                    use_container_width=True
-                ):
-                    st.session_state.timeline_index += 1
-                    st.rerun()
-
-        index = min(
-            st.session_state.timeline_index,
-            len(results) - 1
-        )
-
-        observation = results[index]
-
-        st.image(
-            observation["image_path"],
-            use_container_width=True
-        )
-
-        st.markdown("### Observation information")
-
-        col1, col2, col3 = st.columns(3)
-
-        with col1:
-            st.markdown(
-                f"""
-                <div class="info-panel">
-                    <b>DATE</b><br>
-                    {observation.get("date", "Unknown")}
-                </div>
-                """,
-                unsafe_allow_html=True
-            )
-
-        with col2:
-            st.markdown(
-                f"""
-                <div class="info-panel">
-                    <b>RA / DEC</b><br>
-                    {observation.get("ra_deg", "Unknown")}° /
-                    {observation.get("dec_deg", "Unknown")}°
-                </div>
-                """,
-                unsafe_allow_html=True
-            )
-
-        with col3:
-            st.markdown(
-                f"""
-                <div class="info-panel">
-                    <b>ANGULAR DISTANCE</b><br>
-                    {observation["distance"]:.3f}°
-                </div>
-                """,
-                unsafe_allow_html=True
-            )
-
-        if observation.get("band"):
-            st.markdown(f"**Band:** {observation['band']}")
-
-
-# ============================================================
-# 10. FREE EXPLORATION - ALADIN COCKPIT
-# ============================================================
-
-def exploration_mode():
-
-    page_header("Free Exploration")
-
-    st.markdown("""
-    Explore the celestial sky with your own spacecraft.
-
-    Navigate across the sky, change direction and discover new regions.
-    """)
-
-    map_html = """
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <meta charset="utf-8">
-
-        <link rel="stylesheet"
-        href="https://aladin.cds.unistra.fr/AladinLite/api/v3/latest/aladin.css"/>
-
-        <script src="https://aladin.cds.unistra.fr/AladinLite/api/v3/latest/aladin.js"></script>
-
-        <style>
-
-            * {
-                box-sizing: border-box;
-            }
-
-            body {
-                margin: 0;
-                padding: 0;
-                background: #06162B;
-                color: white;
-                font-family: Arial, sans-serif;
-            }
-
-            .cockpit {
-                background: #071B32;
-                border: 1px solid #31577F;
-                border-radius: 18px;
-                padding: 16px;
-                overflow: hidden;
-            }
-
-            .cockpit-header {
-                display: flex;
-                justify-content: space-between;
-                align-items: center;
-                gap: 10px;
-                padding: 8px 12px 18px 12px;
-                border-bottom: 1px solid #294968;
-                margin-bottom: 14px;
-            }
-
-            .cockpit-title {
-                font-size: 18px;
-                font-weight: 800;
-                letter-spacing: 1px;
-                color: #FFD34E;
-            }
-
-            .status {
-                font-size: 12px;
-                color: #7DDEA4;
-                letter-spacing: 1px;
-            }
-
-            .map-frame {
-                position: relative;
-                border: 1px solid #31577F;
-                border-radius: 12px;
-                overflow: hidden;
-            }
-
-            #aladin-lite-div {
-                width: 100%;
-                height: 570px;
-                background: #000;
-            }
-
-            .map-overlay {
-                position: absolute;
-                top: 12px;
-                left: 12px;
-                z-index: 10;
-                padding: 10px 13px;
-                border-radius: 8px;
-                background: rgba(5, 20, 39, 0.88);
-                border: 1px solid #527da5;
-                font-size: 12px;
-                line-height: 1.7;
-                pointer-events: none;
-            }
-
-            .map-overlay strong {
-                color: #FFD34E;
-            }
-
-            .cockpit-bottom {
-                display: grid;
-                grid-template-columns: 1fr 1fr;
-                gap: 14px;
-                margin-top: 14px;
-            }
-
-            .instrument {
-                background: #0B2542;
-                border: 1px solid #294968;
-                border-radius: 12px;
-                padding: 14px;
-            }
-
-            .instrument-title {
-                color: #FFD34E;
-                font-size: 12px;
-                font-weight: bold;
-                letter-spacing: 1px;
-                margin-bottom: 12px;
-            }
-
-            .coordinates {
-                display: flex;
-                justify-content: space-between;
-                gap: 10px;
-                font-size: 13px;
-                color: #B8CBE0;
-            }
-
-            .coordinates strong {
-                color: white;
-                font-size: 16px;
-                display: block;
-                margin-top: 5px;
-            }
-
-            .direction-grid {
-                display: grid;
-                grid-template-columns: repeat(3, 48px);
-                grid-template-rows: repeat(2, 42px);
-                gap: 6px;
-                justify-content: center;
-            }
-
-            .direction-grid button,
-            .control-row button {
-                background: #174875;
-                color: white;
-                border: 1px solid #527DA5;
-                border-radius: 8px;
-                cursor: pointer;
-                font-size: 17px;
-                font-weight: bold;
-            }
-
-            .direction-grid button:hover,
-            .control-row button:hover {
-                background: #286397;
-                color: #FFD34E;
-                border-color: #FFD34E;
-            }
-
-            .up {
-                grid-column: 2;
-                grid-row: 1;
-            }
-
-            .left {
-                grid-column: 1;
-                grid-row: 2;
-            }
-
-            .down {
-                grid-column: 2;
-                grid-row: 2;
-            }
-
-            .right {
-                grid-column: 3;
-                grid-row: 2;
-            }
-
-            .control-row {
-                display: flex;
-                justify-content: center;
-                gap: 8px;
-                margin-top: 12px;
-            }
-
-            .control-row button {
-                padding: 9px 13px;
-                font-size: 12px;
-            }
-
-            .map-footer {
-                text-align: center;
-                color: #8DA8C5;
-                font-size: 12px;
-                padding: 14px 5px 2px;
-            }
-
-            @media(max-width: 650px) {
-                .cockpit-bottom {
-                    grid-template-columns: 1fr;
-                }
-
-                #aladin-lite-div {
-                    height: 430px;
-                }
-
-                .cockpit-header {
-                    flex-direction: column;
-                }
-            }
-
-        </style>
-    </head>
-
-    <body>
-
-        <div class="cockpit">
-
-            <div class="cockpit-header">
-                <div class="cockpit-title">
-                    SPACECRAFT NAVIGATION SYSTEM
-                </div>
-                <div class="status">
-                    ● NAVIGATION SYSTEM READY
-                </div>
-            </div>
-
-            <div class="map-frame">
-
-                <div id="aladin-lite-div"></div>
-
-                <div class="map-overlay">
-                    <strong>CELESTIAL NAVIGATION</strong><br>
-                    Survey: DSS2 Color<br>
-                    Mode: Free exploration
-                </div>
-
-            </div>
-
-            <div class="cockpit-bottom">
-
-                <div class="instrument">
-
-                    <div class="instrument-title">
-                        CURRENT POSITION
-                    </div>
-
-                    <div class="coordinates">
-
-                        <div>
-                            RIGHT ASCENSION
-                            <strong id="ra-value">Loading...</strong>
-                        </div>
-
-                        <div>
-                            DECLINATION
-                            <strong id="dec-value">Loading...</strong>
-                        </div>
-
-                    </div>
-
-                </div>
-
-                <div class="instrument">
-
-                    <div class="instrument-title">
-                        NAVIGATION CONTROLS
-                    </div>
-
-                    <div class="direction-grid">
-
-                        <button class="up"
-                            onclick="moveSky(0, 5)">↑</button>
-
-                        <button class="left"
-                            onclick="moveSky(-5, 0)">←</button>
-
-                        <button class="down"
-                            onclick="moveSky(0, -5)">↓</button>
-
-                        <button class="right"
-                            onclick="moveSky(5, 0)">→</button>
-
-                    </div>
-
-                    <div class="control-row">
-                        <button onclick="resetSky()">RESET POSITION</button>
-                    </div>
-
-                </div>
-
-            </div>
-
-            <div class="map-footer">
-                Navigate using your mouse, keyboard arrows or the cockpit controls.
-            </div>
-
-        </div>
-
-        <script>
-
-            let aladin = null;
-
-            function updateCoordinates() {
-
-                if (!aladin) return;
-
-                const position = aladin.getRaDec();
-
-                document.getElementById("ra-value").textContent =
-                    position[0].toFixed(4) + "°";
-
-                document.getElementById("dec-value").textContent =
-                    position[1].toFixed(4) + "°";
-            }
-
-            function moveSky(deltaRA, deltaDEC) {
-
-                if (!aladin) return;
-
-                const position = aladin.getRaDec();
-
-                let ra = position[0] + deltaRA;
-                let dec = position[1] + deltaDEC;
-
-                ra = (ra + 360) % 360;
-                dec = Math.max(-90, Math.min(90, dec));
-
-                aladin.gotoRaDec(ra, dec);
-
-                setTimeout(updateCoordinates, 300);
-            }
-
-            function resetSky() {
-
-                if (!aladin) return;
-
-                aladin.gotoRaDec(180, 0);
-
-                setTimeout(updateCoordinates, 300);
-            }
-
-            A.init.then(() => {
-
-                aladin = A.aladin(
-                    '#aladin-lite-div',
-                    {
-                        survey: 'P/DSS2/color',
-                        fov: 60,
-                        target: '180 0'
-                    }
-                );
-
-                setInterval(updateCoordinates, 500);
-
-                document.addEventListener('keydown', (event) => {
-
-                    if (
-                        event.target.tagName === 'INPUT' ||
-                        event.target.tagName === 'TEXTAREA'
-                    ) {
-                        return;
-                    }
-
-                    if (event.key === 'ArrowRight') {
-                        moveSky(5, 0);
-                    }
-
-                    if (event.key === 'ArrowLeft') {
-                        moveSky(-5, 0);
-                    }
-
-                    if (event.key === 'ArrowUp') {
-                        moveSky(0, 5);
-                    }
-
-                    if (event.key === 'ArrowDown') {
-                        moveSky(0, -5);
-                    }
-                });
-
-            });
-
-        </script>
-
-    </body>
-    </html>
-    """
-
-    components.html(
-        map_html,
-        height=850,
-        scrolling=False
+    st.markdown(
+        '<div class="main-title">SPHEREx Explorer</div>',
+        unsafe_allow_html=True
     )
 
-
-# ============================================================
-# 11. HOME PAGE
-# ============================================================
-
-if st.session_state.mode == "home":
-
-    show_decorations()
-
     st.markdown("""
-    <div class="home-title">
-        SPHEREx Explorer
-    </div>
-
-    <div class="explanation-box">
-        <p>
-            Discover the sky through two exploration modes.<br>
-            Search for observations using astronomical coordinates,
-            or navigate freely across the celestial map.<br>
-            Choose your preferred way to explore the Universe.
-        </p>
+    <div class="intro-box">
+        Discover the sky through two exploration modes.
+        Search for observations using astronomical coordinates,
+        or navigate freely across the celestial map.
+        Choose your preferred way to explore the Universe.
     </div>
     """, unsafe_allow_html=True)
 
-    col1, col2 = st.columns(2, gap="large")
+    left, col1, col2, right = st.columns([2.5, 1.6, 1.6, 2.5])
 
     with col1:
-
-        if st.button(
-            "COORDINATE SEARCH",
-            use_container_width=True,
-            key="home_coordinates"
-        ):
-            st.session_state.mode = "coordinates"
+        if st.button("COORDINATE SEARCH"):
+            st.session_state.page = "coordinates"
             st.rerun()
 
     with col2:
-
-        if st.button(
-            "FREE EXPLORATION",
-            use_container_width=True,
-            key="home_free"
-        ):
-            st.session_state.mode = "free"
+        if st.button("FREE EXPLORATION"):
+            st.session_state.page = "exploration"
             st.rerun()
 
 
-# ============================================================
-# 12. DISPLAY SELECTED MODE
-# ============================================================
+# =========================================================
+# MODE 1 : COORDINATE SEARCH
+# =========================================================
 
-elif st.session_state.mode == "coordinates":
+elif st.session_state.page == "coordinates":
 
-    coordinate_search_mode()
+    if st.button("← BACK TO HOME"):
+        go_home()
+        st.rerun()
 
-elif st.session_state.mode == "free":
+    st.markdown(
+        '<div class="main-title">Coordinate Search</div>',
+        unsafe_allow_html=True
+    )
 
-    exploration_mode()
+    st.markdown("""
+    <div class="intro-box">
+        Enter the celestial coordinates of a region to find
+        the observations available in our dataset.
+    </div>
+    """, unsafe_allow_html=True)
+
+    st.markdown(
+        '<div class="section-title">Search coordinates</div>',
+        unsafe_allow_html=True
+    )
+
+    col1, col2, col3 = st.columns(3)
+
+    with col1:
+        ra = st.number_input(
+            "Right Ascension (RA) in degrees",
+            min_value=0.0,
+            max_value=360.0,
+            value=10.0,
+            step=0.1
+        )
+
+    with col2:
+        dec = st.number_input(
+            "Declination (Dec) in degrees",
+            min_value=-90.0,
+            max_value=90.0,
+            value=20.0,
+            step=0.1
+        )
+
+    with col3:
+        radius = st.number_input(
+            "Search radius (degrees)",
+            min_value=0.01,
+            max_value=180.0,
+            value=2.0,
+            step=0.1
+        )
+
+    if st.button("SEARCH OBSERVATIONS"):
+        st.session_state.search_results = search_observations(
+            ra, dec, radius
+        )
+        st.session_state.search_done = True
+
+    if st.session_state.get("search_done", False):
+
+        results = st.session_state.get("search_results", [])
+
+        st.markdown(
+            '<div class="section-title">Search results</div>',
+            unsafe_allow_html=True
+        )
+
+        if not results:
+            st.warning(
+                "No observations were found in this region "
+                "in the current local dataset."
+            )
+
+        else:
+            st.success(f"{len(results)} observation(s) found.")
+
+            for i, obs in enumerate(results):
+
+                st.markdown("---")
+
+                col_image, col_info = st.columns([1, 2])
+
+                filename = obs.get("filename", "")
+                image_path = IMAGE_DIR / filename
+
+                with col_image:
+                    if filename and image_path.exists():
+                        st.image(str(image_path), use_container_width=True)
+                    else:
+                        st.warning(f"Image not found: {filename}")
+
+                with col_info:
+                    st.markdown(f"### Observation {i + 1}")
+
+                    st.write(f"**Date:** {obs.get('date', 'Unknown')}")
+                    st.write(f"**RA:** {obs.get('ra_deg', 'Unknown')}°")
+                    st.write(f"**Dec:** {obs.get('dec_deg', 'Unknown')}°")
+                    st.write(f"**Band:** {obs.get('band', 'Unknown')}")
+                    st.write(
+                        f"**Angular distance:** "
+                        f"{obs.get('distance', 0):.4f}°"
+                    )
 
 
-# ============================================================
-# 13. FOOTER
-# ============================================================
+# =========================================================
+# MODE 2 : FREE EXPLORATION - STELLARIUM
+# =========================================================
 
-st.markdown("""
-<div class="footer">
-    SPHEREx Explorer · Explore the sky, one observation at a time.
-</div>
-""", unsafe_allow_html=True)
+elif st.session_state.page == "exploration":
+
+    if st.button("← BACK TO HOME"):
+        go_home()
+        st.rerun()
+
+    st.markdown(
+        '<div class="main-title">Free Exploration</div>',
+        unsafe_allow_html=True
+    )
+
+    st.markdown("""
+    <div class="intro-box">
+        Explore the Universe through an interactive planetarium.
+        Navigate across the sky, discover stars, planets, galaxies
+        and constellations.
+    </div>
+    """, unsafe_allow_html=True)
+
+    st.markdown(
+        '<div class="section-title">Explore the Universe</div>',
+        unsafe_allow_html=True
+    )
+
+    # Stellarium Web embedded in Streamlit
+    st.components.v1.iframe(
+        "https://stellarium-web.org/",
+        height=780,
+        scrolling=True
+    )
+
+    st.markdown("""
+    <div class="info-box">
+        <b>How to explore:</b><br>
+        • Move around the sky to discover different regions.<br>
+        • Zoom in to observe stars and celestial objects.<br>
+        • Search for stars, planets, galaxies and constellations.<br>
+        • Select objects to access the information provided by Stellarium.
+    </div>
+    """, unsafe_allow_html=True)
+
+    st.markdown(
+        "[Open Stellarium Web in a separate tab](https://stellarium-web.org/)"
+    )
