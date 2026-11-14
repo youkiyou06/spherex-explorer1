@@ -3,10 +3,16 @@
 Installation (Python 3.13 conseillé) :
     python -m pip install requests astroquery astropy
 
+Utilisation depuis un autre fichier Python :
+    from extracteur2 import rechercher_image
+
+    chemin = rechercher_image(ra=10.5, dec=-20.0)
+    print(chemin)
+
 Le service SIA d'IRSA est interrogé par Astroquery. Les progrès sont affichés
 pour distinguer une recherche en cours d'un programme bloqué.
 
-Le script supporte maintenant un filtrage additionnel sur la bande spectrale
+Le script supporte un filtrage additionnel sur la bande spectrale
 (BAND, en µm) et sur la plage temporelle (TIME, en MJD).
 """
 
@@ -20,6 +26,8 @@ from astropy.coordinates import SkyCoord
 from astropy.utils.data import conf as astropy_conf
 from astroquery.ipac.irsa import Irsa
 
+
+__all__ = ["rechercher_image"]
 
 COLLECTIONS = [
     "spherex_dr1",
@@ -80,8 +88,20 @@ def _applique_filtres_resultats(resultats, band_wave_um=None, time_mjd=None):
 def rechercher_image(ra, dec, rayon_deg=0.1, dossier="spherex_images", band_wave_um=None, time_mjd=None):
     """Télécharge le premier produit FITS SPHEREx trouvé autour de la position.
 
-    band_wave_um: tuple (min_um, max_um) ou None
-    time_mjd: tuple (min_mjd, max_mjd) ou None
+    Args:
+        ra: Ascension droite en degrés.
+        dec: Déclinaison en degrés.
+        rayon_deg: Rayon de recherche en degrés.
+        dossier: Dossier de destination des téléchargements.
+        band_wave_um: Tuple (min_um, max_um) ou None.
+        time_mjd: Tuple (min_mjd, max_mjd) ou None.
+
+    Returns:
+        Le chemin (Path) du fichier FITS téléchargé.
+
+    Exemple d'import :
+        from extracteur2 import rechercher_image
+        chemin = rechercher_image(ra=10.5, dec=-20.0)
     """
     ra, dec, rayon_deg = float(ra), float(dec), float(rayon_deg)
     if not (0 <= ra < 360 and -90 <= dec <= 90):
@@ -105,7 +125,7 @@ def rechercher_image(ra, dec, rayon_deg=0.1, dossier="spherex_images", band_wave
 
     print("Interrogation de l'archive IRSA (SIA)…", flush=True)
     if band_wave_um is not None:
-        print(f"Filtre spectrale : {band_wave_um[0]}–{band_wave_um[1]} µm", flush=True)
+        print(f"Filtre spectral : {band_wave_um[0]}–{band_wave_um[1]} µm", flush=True)
     if time_mjd is not None:
         print(f"Filtre temporel : MJD {time_mjd[0]}–{time_mjd[1]}", flush=True)
 
