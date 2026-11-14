@@ -1,0 +1,851 @@
+
+from __future__ import annotations
+
+import json
+import math
+from pathlib import Path
+
+import streamlit as st
+import streamlit.components.v1 as components
+
+
+# ============================================================
+# 1. CONFIGURATION
+# ============================================================
+
+BASE_DIR = Path(__file__).resolve().parent
+IMAGES_DIR = BASE_DIR / "images"
+DATABASE_FILE = BASE_DIR / "observations.json"
+
+st.set_page_config(
+    page_title="SPHEREx Explorer",
+    page_icon="🌌",
+    layout="wide"
+)
+
+
+# ============================================================
+# 2. STYLE
+# ============================================================
+
+st.markdown("""
+<style>
+
+.stApp {
+    background: linear-gradient(140deg, #050D20, #0B1930);
+    color: white;
+}
+
+.block-container {
+    max-width: 1150px;
+    padding-top: 2rem;
+}
+
+h1, h2, h3, p, label {
+    color: white !important;
+}
+
+.hero {
+    background: linear-gradient(110deg, #102C50, #10203B);
+    border: 1px solid #28517B;
+    border-radius: 18px;
+    padding: 30px;
+    margin-bottom: 25px;
+}
+
+.hero-title {
+    font-size: 38px;
+    font-weight: 800;
+    color: white;
+}
+
+.hero-subtitle {
+    color: #A9C8E8;
+    font-size: 16px;
+}
+
+.stForm {
+    background: #10223D;
+    border: 1px solid #29466A;
+    border-radius: 15px;
+    padding: 22px;
+}
+
+[data-testid="stFormSubmitButton"] button {
+    background: linear-gradient(90deg, #087FCB, #20B8ED);
+    color: white;
+    border: none;
+    border-radius: 10px;
+    font-weight: bold;
+    min-height: 48px;
+}
+
+.stButton button {
+    background: #163454;
+    color: white;
+    border: 1px solid #3476A8;
+    border-radius: 10px;
+    min-height: 48px;
+    font-weight: bold;
+}
+
+[data-testid="stAlert"] {
+    background-color: white !important;
+    border: 1px solid #CCCCCC !important;
+}
+
+[data-testid="stAlert"] p,
+[data-testid="stAlert"] div,
+[data-testid="stAlert"] span {
+    color: black !important;
+}
+
+</style>
+""", unsafe_allow_html=True)
+
+
+# ============================================================
+# 3. CHARGEMENT DES OBSERVATIONS
+# ============================================================
+
+def load_observations():
+
+    if not DATABASE_FILE.exists():
+        return []
+
+    with open(DATABASE_FILE, "r", encoding="utf-8") as file:
+        data = json.load(file)
+
+    return data.get("observations", [])
+
+
+# ============================================================
+# 4. DISTANCE ANGULAIRE
+# ============================================================
+
+def angular_separation(ra1, dec1, ra2, dec2):
+
+    ra1 = math.radians(ra1)
+    dec1 = math.radians(dec1)
+    ra2 = math.radians(ra2)
+    dec2 = math.radians(dec2)
+
+    delta_ra = ra2 - ra1
+    delta_dec = dec2 - dec1
+
+    a = (
+        math.sin(delta_dec / 2) ** 2
+        + math.cos(dec1)
+        * math.cos(dec2)
+        * math.sin(delta_ra / 2) ** 2
+    )
+
+    a = max(0.0, min(1.0, a))
+
+    return math.degrees(
+        2 * math.asin(math.sqrt(a))
+    )
+
+
+# ============================================================
+# 5. RECHERCHE LOCALE
+# ============================================================
+
+def search_observations(ra, dec, radius):
+
+    all_observations = load_observations()
+    matching = []
+
+    for observation in all_observations:
+
+        try:
+
+            image_ra = float(observation["ra_deg"])
+            image_dec = float(observation["dec_deg"])
+
+            distance = angular_separation(
+                ra, dec,
+                image_ra, image_dec
+            )
+
+            if distance <= radius:
+
+                image_path = (
+                    IMAGES_DIR / observation["filename"]
+                ).resolve()
+
+                try:
+                    image_path.relative_to(IMAGES_DIR.resolve())
+                except ValueError:
+                    continue
+
+                if not image_path.is_file():
+                    continue
+
+                result = dict(observation)
+                result["image_path"] = image_path
+                result["distance"] = distance
+
+                matching.append(result)
+
+        except (KeyError, TypeError, ValueError):
+            continue
+
+    matching.sort(
+        key=lambda item: str(item.get("date", ""))
+    )
+
+    return matching
+
+
+# ============================================================
+# 6. EXPLORATION LIBRE SANS COCKPIT
+# ============================================================
+
+def exploration_mode():
+
+    st.markdown("## 🚀 Free Exploration")
+
+    st.write(
+        "Navigate freely across the celestial sky. "
+        "Use the directional buttons or your keyboard."
+    )
+
+    html = """
+    <!DOCTYPE html>
+    <html>
+
+    <head>
+        <meta charset="UTF-8">
+
+        <style>
+
+            body {
+                margin: 0;
+                background: #030914;
+                font-family: Arial, sans-serif;
+                color: white;
+            }
+
+            #map-container {
+                position: relative;
+                width: 100%;
+                height: 620px;
+                overflow: hidden;
+                background: #030914;
+                border: 1px solid #168bd0;
+                border-radius: 12px;
+            }
+
+            #aladin-lite-div {
+                width: 100%;
+                height: 100%;
+            }
+
+            #loading {
+                position: absolute;
+                top: 50%;
+                left: 50%;
+                transform: translate(-50%, -50%);
+                z-index: 5;
+                background: #071a30;
+                padding: 18px;
+                border: 1px solid #00bfff;
+                border-radius: 10px;
+                text-align: center;
+            }
+
+            #coordinates {
+                position: absolute;
+                top: 15px;
+                left: 15px;
+                z-index: 20;
+                background: rgba(0, 10, 25, 0.92);
+                border: 1px solid #00bfff;
+                border-radius: 10px;
+                padding: 12px;
+                font-size: 13px;
+                line-height: 1.8;
+                pointer-events: none;
+            }
+
+            .blue {
+                color: #00e5ff;
+            }
+
+            #crosshair {
+                position: absolute;
+                top: 50%;
+                left: 50%;
+                width: 44px;
+                height: 44px;
+                transform: translate(-50%, -50%);
+                z-index: 10;
+                pointer-events: none;
+            }
+
+            #crosshair::before {
+                content: "";
+                position: absolute;
+                left: 21px;
+                height: 44px;
+                width: 2px;
+                background: #00e5ff;
+            }
+
+            #crosshair::after {
+                content: "";
+                position: absolute;
+                top: 21px;
+                width: 44px;
+                height: 2px;
+                background: #00e5ff;
+            }
+
+            #controls {
+                position: absolute;
+                right: 25px;
+                bottom: 25px;
+                z-index: 30;
+                display: grid;
+                grid-template-columns: 55px 55px 55px;
+                grid-template-rows: 55px 55px 55px;
+                gap: 5px;
+            }
+
+            .arrow {
+                background: rgba(0, 30, 60, 0.95);
+                color: #00e5ff;
+                border: 1px solid #00bfff;
+                border-radius: 10px;
+                font-size: 25px;
+                cursor: pointer;
+                transition: 0.15s;
+            }
+
+            .arrow:hover {
+                background: #087fc5;
+                color: white;
+            }
+
+            .arrow:active {
+                transform: scale(0.92);
+                background: #00bfff;
+            }
+
+            #up {
+                grid-column: 2;
+                grid-row: 1;
+            }
+
+            #left {
+                grid-column: 1;
+                grid-row: 2;
+            }
+
+            #right {
+                grid-column: 3;
+                grid-row: 2;
+            }
+
+            #down {
+                grid-column: 2;
+                grid-row: 3;
+            }
+
+            #instructions {
+                position: absolute;
+                bottom: 15px;
+                left: 15px;
+                z-index: 20;
+                color: #00e5ff;
+                font-size: 12px;
+                background: rgba(0, 10, 25, 0.85);
+                padding: 9px;
+                border-radius: 7px;
+            }
+
+            @media (max-width: 600px) {
+                #controls {
+                    right: 10px;
+                    bottom: 10px;
+                    transform: scale(0.85);
+                    transform-origin: bottom right;
+                }
+            }
+
+        </style>
+    </head>
+
+    <body>
+
+        <div id="map-container">
+
+            <div id="aladin-lite-div"></div>
+
+            <div id="loading">
+                Loading the celestial map...
+            </div>
+
+            <div id="coordinates">
+                <strong class="blue">NAVIGATION DATA</strong>
+                <div id="ra">RA: --</div>
+                <div id="dec">DEC: --</div>
+                <div id="fov">FOV: --</div>
+                <div id="status">STATUS: LOADING</div>
+            </div>
+
+            <div id="crosshair"></div>
+
+            <div id="controls">
+                <button class="arrow" id="up">▲</button>
+                <button class="arrow" id="left">◀</button>
+                <button class="arrow" id="right">▶</button>
+                <button class="arrow" id="down">▼</button>
+            </div>
+
+            <div id="instructions">
+                USE ARROWS OR KEYBOARD TO MOVE
+            </div>
+
+        </div>
+
+        <script>
+
+        const loading = document.getElementById("loading");
+
+        function showError(message) {
+            loading.style.display = "block";
+            loading.textContent = message;
+        }
+
+        const script = document.createElement("script");
+
+        script.src =
+            "https://aladin.cds.unistra.fr/AladinLite/api/v3/latest/aladin.js";
+
+        script.onload = function() {
+
+            if (typeof A === "undefined") {
+                showError("Aladin Lite could not be initialized.");
+                return;
+            }
+
+            A.init.then(() => {
+
+                const aladin = A.aladin(
+                    "#aladin-lite-div",
+                    {
+                        target: "10.684 41.269",
+                        fov: 2,
+                        cooFrame: "ICRS",
+                        survey: "P/DSS2/color",
+                        showReticle: false,
+                        showCooGrid: true,
+                        showZoomControl: true,
+                        showFullscreenControl: true,
+                        showContextMenu: true
+                    }
+                );
+
+                loading.style.display = "none";
+
+                function updateCoordinates() {
+
+                    const position = aladin.getRaDec();
+                    const field = aladin.getFov();
+
+                    document.getElementById("ra").textContent =
+                        "RA: " + position[0].toFixed(5) + "°";
+
+                    document.getElementById("dec").textContent =
+                        "DEC: " + position[1].toFixed(5) + "°";
+
+                    document.getElementById("fov").textContent =
+                        "FOV: " + field[0].toFixed(3) + "°";
+
+                    document.getElementById("status").textContent =
+                        "STATUS: EXPLORING";
+                }
+
+                function moveShip(direction) {
+
+                    const position = aladin.getRaDec();
+                    const field = aladin.getFov();
+
+                    let ra = position[0];
+                    let dec = position[1];
+
+                    const step = Math.max(field[0] * 0.25, 0.02);
+
+                    const cosDec = Math.max(
+                        0.1,
+                        Math.abs(Math.cos(dec * Math.PI / 180))
+                    );
+
+                    const raStep = step / cosDec;
+
+                    if (direction === "up") {
+                        dec += step;
+                    }
+
+                    if (direction === "down") {
+                        dec -= step;
+                    }
+
+                    if (direction === "left") {
+                        ra -= raStep;
+                    }
+
+                    if (direction === "right") {
+                        ra += raStep;
+                    }
+
+                    dec = Math.max(-89.9, Math.min(89.9, dec));
+                    ra = ((ra % 360) + 360) % 360;
+
+                    aladin.gotoRaDec(ra, dec);
+                    updateCoordinates();
+                }
+
+                document.getElementById("up").onclick =
+                    () => moveShip("up");
+
+                document.getElementById("down").onclick =
+                    () => moveShip("down");
+
+                document.getElementById("left").onclick =
+                    () => moveShip("left");
+
+                document.getElementById("right").onclick =
+                    () => moveShip("right");
+
+                document.addEventListener("keydown", function(event) {
+
+                    const keys = {
+                        ArrowUp: "up",
+                        ArrowDown: "down",
+                        ArrowLeft: "left",
+                        ArrowRight: "right"
+                    };
+
+                    if (keys[event.key]) {
+                        event.preventDefault();
+                        moveShip(keys[event.key]);
+                    }
+                });
+
+                aladin.on("positionChanged", updateCoordinates);
+                aladin.on("zoomChanged", updateCoordinates);
+
+                updateCoordinates();
+
+            }).catch(error => {
+                console.error(error);
+                showError("Aladin initialization failed.");
+            });
+        };
+
+        script.onerror = function() {
+            showError("Unable to load the sky map. Check your internet connection.");
+        };
+
+        document.head.appendChild(script);
+
+        </script>
+
+    </body>
+    </html>
+    """
+
+    components.html(
+        html,
+        height=640,
+        scrolling=False
+    )
+
+
+# ============================================================
+# 7. VARIABLES DE SESSION
+# ============================================================
+
+if "mode" not in st.session_state:
+    st.session_state.mode = None
+
+if "observations" not in st.session_state:
+    st.session_state.observations = []
+
+if "search_done" not in st.session_state:
+    st.session_state.search_done = False
+
+if "timeline_index" not in st.session_state:
+    st.session_state.timeline_index = 0
+
+
+# ============================================================
+# 8. EN-TETE
+# ============================================================
+
+st.markdown("""
+<div class="hero">
+    <div class="hero-title">
+        🌌 SPHEREx Explorer
+    </div>
+
+    <div class="hero-subtitle">
+        Explore the evolution of the universe through time.
+    </div>
+</div>
+""", unsafe_allow_html=True)
+
+
+# ============================================================
+# 9. CHOIX DU MODE
+# ============================================================
+
+st.markdown("## Choose your exploration mode")
+
+st.write("How would you like to explore the Universe?")
+
+col1, col2 = st.columns(2)
+
+with col1:
+
+    if st.button(
+        "🎯 COORDINATE SEARCH",
+        use_container_width=True
+    ):
+
+        st.session_state.mode = "coordinates"
+        st.rerun()
+
+with col2:
+
+    if st.button(
+        "🚀 FREE EXPLORATION",
+        use_container_width=True
+    ):
+
+        st.session_state.mode = "free"
+        st.rerun()
+
+
+# ============================================================
+# 10. MODE COORDINATES
+# ============================================================
+
+if st.session_state.mode == "coordinates":
+
+    st.markdown("---")
+    st.markdown("## 🎯 Coordinate Search")
+
+    st.write(
+        "Enter celestial coordinates to discover "
+        "the available observations."
+    )
+
+    with st.form("search_form"):
+
+        col1, col2 = st.columns(2)
+
+        with col1:
+
+            ra = st.number_input(
+                "Right Ascension (RA) in degrees",
+                min_value=0.0,
+                max_value=360.0,
+                value=10.0,
+                format="%.6f"
+            )
+
+        with col2:
+
+            dec = st.number_input(
+                "Declination (Dec) in degrees",
+                min_value=-90.0,
+                max_value=90.0,
+                value=20.0,
+                format="%.6f"
+            )
+
+        radius = st.number_input(
+            "Search radius (degrees)",
+            min_value=0.001,
+            max_value=180.0,
+            value=0.1,
+            step=0.01,
+            format="%.3f"
+        )
+
+        search = st.form_submit_button(
+            "🚀 SEARCH OBSERVATIONS",
+            use_container_width=True
+        )
+
+    if search:
+
+        st.session_state.search_done = False
+        st.session_state.observations = []
+        st.session_state.timeline_index = 0
+
+        try:
+
+            with st.spinner("Searching local observations..."):
+
+                observations = search_observations(
+                    ra % 360,
+                    dec,
+                    radius
+                )
+
+            st.session_state.observations = observations
+            st.session_state.search_done = True
+
+        except Exception as error:
+
+            st.error(f"Search failed: {error}")
+
+    if st.session_state.search_done:
+
+        observations = st.session_state.observations
+
+        st.markdown("---")
+
+        if not observations:
+
+            st.warning(
+                "No observations found. "
+                "Try increasing the search radius."
+            )
+
+        else:
+
+            total = len(observations)
+
+            st.success(
+                f"{total} observation(s) found."
+            )
+
+            st.caption(
+                f"RA: {ra:.5f}° | Dec: {dec:.5f}° | "
+                f"Radius: {radius:.3f}°"
+            )
+
+            st.markdown("### ⏳ Observation timeline")
+
+            index = st.session_state.timeline_index
+
+            col_previous, col_counter, col_next = st.columns(
+                [1, 2, 1]
+            )
+
+            with col_previous:
+
+                if st.button(
+                    "⬅ Previous",
+                    use_container_width=True,
+                    disabled=index == 0
+                ):
+
+                    st.session_state.timeline_index -= 1
+
+                    if "timeline_slider" in st.session_state:
+                        st.session_state.timeline_slider = (
+                            st.session_state.timeline_index
+                        )
+
+                    st.rerun()
+
+            with col_counter:
+
+                st.markdown(
+                    f"<p style='text-align:center;'>"
+                    f"Observation {index + 1} / {total}"
+                    f"</p>",
+                    unsafe_allow_html=True
+                )
+
+            with col_next:
+
+                if st.button(
+                    "Next ➡",
+                    use_container_width=True,
+                    disabled=index >= total - 1
+                ):
+
+                    st.session_state.timeline_index += 1
+
+                    if "timeline_slider" in st.session_state:
+                        st.session_state.timeline_slider = (
+                            st.session_state.timeline_index
+                        )
+
+                    st.rerun()
+
+            if total > 1:
+
+                selected_index = st.slider(
+                    "Move through time",
+                    min_value=0,
+                    max_value=total - 1,
+                    value=st.session_state.timeline_index,
+                    key="timeline_slider"
+                )
+
+                if selected_index != st.session_state.timeline_index:
+
+                    st.session_state.timeline_index = selected_index
+                    st.rerun()
+
+            current = observations[
+                st.session_state.timeline_index
+            ]
+
+            st.markdown("---")
+            st.markdown("### 🔭 Current observation")
+
+            st.markdown(
+                f"**Observation date:** "
+                f"{current.get('date', 'Unknown')}"
+            )
+
+            if current.get("band"):
+                st.markdown(
+                    f"**Spectral band:** {current['band']}"
+                )
+
+            st.caption(
+                f"Angular distance: "
+                f"{current['distance']:.5f}°"
+            )
+
+            st.image(
+                str(current["image_path"]),
+                caption=(
+                    "Observation — "
+                    + str(current.get("date", "Unknown"))
+                ),
+                use_container_width=True
+            )
+
+
+# ============================================================
+# 11. MODE EXPLORATION LIBRE
+# ============================================================
+
+elif st.session_state.mode == "free":
+
+    st.markdown("---")
+
+    exploration_mode()
+
+
+# ============================================================
+# 12. PIED DE PAGE
+# ============================================================
+
+st.markdown("---")
+
+st.caption(
+    "SPHEREx Explorer | NASA Space Apps Challenge"
+)
