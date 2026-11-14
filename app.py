@@ -30,9 +30,35 @@ with st.form("search_form"):
 
     search = st.form_submit_button("Search")
 
-# Affichage des coordonnées après validation du formulaire.
+# Association de l'image à ses coordonnées célestes.
+
+images = [
+    {
+        "file": "images/Test.jpg",
+        "ra": 10.0,
+        "dec": 20.0
+    }
+]
+
+# Recherche de l'image correspondant aux coordonnées saisies.
 
 if search:
-    st.write("Selected coordinates:")
-    st.write("Right Ascension:", ra)
-    st.write("Declination:", dec)
+
+    image_found = False
+
+    for image in images:
+
+        if ra == image["ra"] and dec == image["dec"]:
+
+            st.header("Sky image")
+
+            st.image(
+                image["file"],
+                caption="SPHEREx observation",
+                use_container_width=True
+            )
+
+            image_found = True
+
+    if not image_found:
+        st.warning("No image found for these coordinates.")
