@@ -1,1 +1,11 @@
+!pip install astroquery
+from astroquery.ipac.irsa import Irsa
+from astropy.coordinates import SkyCoord
+import astropy.units as u
 
+endroit = SkyCoord(ra=10, dec=41, unit='deg')
+photo1 = Irsa.query_sia(pos=(endroit, 1*u.deg), collection='spherex_dr1')
+photo2 = Irsa.query_sia(pos=(endroit, 1*u.deg), collection='spherex_qr3')
+
+print(photo1[0]['access_url'])
+print(photo2[0]['access_url'])
