@@ -1,17 +1,22 @@
-"""SPHEREx image discovery, download, and comparison helpers.
+"""SPHEREx service layer for integration with the team's UI and database.
 
-Designed to be imported by the project's Streamlit interface; no prompts or
-network requests run at import time. Comparisons are exploratory products, not
-scientific transient detections. Compare products with matching bands, units,
-and processing levels whenever possible.
+This file intentionally has no Streamlit widgets, terminal prompts, or network
+activity at import time. UI code can call search_observations(), download_observation(),
+and compare_observations()/compare_timeline(). Results are plain dictionaries,
+lists and NumPy arrays; persist the returned observation metadata and comparison
+summary through the database adapter defined by the database teammate. No DB
+schema is assumed here.
+
+Scientific caveat: difference-image candidates are exploratory, not confirmed
+moving objects or evidence of Planet X.
 """
-
 from __future__ import annotations
 
+import hashlib
 import os
 import tempfile
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 from urllib.parse import urlparse
 
 import numpy as np
@@ -24,97 +29,108 @@ from astropy.wcs import WCS
 from astroquery.ipac.irsa import Irsa
 from reproject import reproject_interp
 
-
-DATA_DIR = Path(__file__).resolve().parent / "data"
 DEFAULT_COLLECTIONS = ("spherex_dr1", "spherex_qr3")
-DISPLAY_COLUMNS = {
-    "access_url", "obs_id", "s_ra", "s_dec", "band", "filter", "time",
-    "t_min", "t_max", "mjd", "instrument", "product_type", "dataproduct_type",
-}
+DEFAULT_CACHE_DIR = Path(__file__).resolve().parent / "data"
 
 
-def _python_value(value: Any) -> Any:
-    """Convert Astropy/NumPy table values to values usable by a UI or JSON."""
+def _plain(value: Any) -> Any:
+    """Convert Astropy/NumPy scalar values into serializable Python values."""
     if np.ma.is_masked(value):
         return None
     if isinstance(value, np.generic):
         value = value.item()
     if isinstance(value, bytes):
         return value.decode("utf-8", errors="replace").strip()
-    if isinstance(value, (str, int, float, bool)) or value is None:
-        if isinstance(value, float) and not np.isfinite(value):
-            return None
+    if isinstance(value, float) and not np.isfinite(value):
+        return None
+    if value is None or isinstance(value, (str, int, float, bool)):
         return value
     return str(value)
+
+
+def _get(record: Mapping[str, Any], *names: str) -> Any:
+    fields = {str(key).lower(): value for key, value in record.items()}
+    for name in names:
+        value = fields.get(name.lower())
+        if value is not None and str(value).strip().lower() not in {"", "--", "nan", "none"}:
+            return value
+    return None
+
+
+def _sort_key(record: Mapping[str, Any]) -> tuple[int, float | str, str]:
+    """Sort by MJD when available; otherwise use the date string."""
+    mjd = _get(record, "mjd", "mjd_obs", "t_min")
+    try:
+        if mjd is not None:
+            return (0, float(mjd), str(record.get("observation_id", "")))
+    except (TypeError, ValueError):
+        pass
+    date = _get(record, "time", "date_obs", "obs_date", "t_min")
+    return (1, str(date or ""), str(record.get("observation_id", "")))
 
 
 def search_observations(
     ra_deg: float,
     dec_deg: float,
     radius_deg: float = 1.0,
-    collection: str = "spherex_dr1",
+    collections: Sequence[str] = DEFAULT_COLLECTIONS,
     band: str | None = None,
     limit: int = 100,
 ) -> list[dict[str, Any]]:
-    """Search an IRSA SPHEREx collection and return UI-friendly records.
+    """Search IRSA SPHEREx collections and return UI/database-friendly records.
 
-    Parameters are in degrees. ``band`` filters common ``band``/``filter``
-    columns when those fields are supplied by IRSA. Every returned record keeps
-    the original metadata and includes a stable ``index`` for selection.
+    Coordinates/radius are in degrees. ``band`` filters common band/filter
+    columns when IRSA provides one. Records retain IRSA metadata and add stable
+    ``observation_id``, ``collection``, ``epoch``, and ``band_value`` fields.
+    Use observation_id as a DB/upsert key; list positions are not stable IDs.
     """
-    if not -90 <= float(dec_deg) <= 90:
-        raise ValueError("dec_deg must be between -90 and 90 degrees.")
-    if not 0 < float(radius_deg) <= 180:
-        raise ValueError("radius_deg must be greater than 0 and at most 180 degrees.")
+    ra_deg, dec_deg, radius_deg = float(ra_deg), float(dec_deg), float(radius_deg)
+    if not 0 <= ra_deg <= 360:
+        raise ValueError("RA must be between 0 and 360 degrees.")
+    if not -90 <= dec_deg <= 90:
+        raise ValueError("Dec must be between -90 and 90 degrees.")
+    if not 0 < radius_deg <= 180:
+        raise ValueError("Search radius must be greater than 0 and at most 180 degrees.")
     if int(limit) < 1:
         raise ValueError("limit must be at least 1.")
-    if not collection or not collection.strip():
-        raise ValueError("collection must not be empty.")
+    if not collections:
+        raise ValueError("At least one IRSA collection is required.")
 
-    position = SkyCoord(ra=float(ra_deg) * u.deg, dec=float(dec_deg) * u.deg)
-    results = Irsa.query_sia(pos=(position, float(radius_deg) * u.deg), collection=collection)
-    url_column = next((name for name in results.colnames if name.lower() == "access_url"), None)
-    if url_column is None:
-        raise RuntimeError(
-            f"IRSA returned no access_url column for {collection!r}; "
-            f"available columns: {', '.join(results.colnames)}"
-        )
-
+    position = SkyCoord(ra=ra_deg * u.deg, dec=dec_deg * u.deg, frame="icrs")
     records: list[dict[str, Any]] = []
-    band_names = [name for name in results.colnames if name.lower() in {"band", "filter"}]
-    for row in results:
-        record = {name: _python_value(row[name]) for name in results.colnames}
-        record["collection"] = collection
-        url = record.get(url_column)
-        if not isinstance(url, str) or not url.strip():
+    seen_urls: set[str] = set()
+    for collection in collections:
+        table = Irsa.query_sia(pos=(position, radius_deg * u.deg), collection=collection)
+        url_column = next((name for name in table.colnames if name.lower() == "access_url"), None)
+        if url_column is None:
             continue
-        record["access_url"] = url.strip()
-        if band and band_names:
-            available_bands = [str(record.get(name, "")).casefold() for name in band_names]
-            if not any(band.casefold() in value for value in available_bands):
+        for row in table:
+            record = {str(name): _plain(row[name]) for name in table.colnames}
+            raw_url = record.get(url_column)
+            if not isinstance(raw_url, str):
                 continue
-        record["index"] = len(records)
-        records.append(record)
+            url = raw_url.strip()
+            if urlparse(url).scheme.lower() not in {"http", "https"} or url in seen_urls:
+                continue
+            band_value = _get(record, "band", "filter", "filter_name")
+            if band and band_value is not None and band.casefold() not in str(band_value).casefold():
+                continue
+            seen_urls.add(url)
+            record["access_url"] = url
+            record["collection"] = collection
+            record["band_value"] = band_value
+            record["epoch"] = _get(record, "mjd", "mjd_obs", "time", "date_obs", "obs_date", "t_min")
+            record["observation_id"] = str(
+                _get(record, "obs_id", "obsid", "dp_id", "obs_publisher_did")
+                or hashlib.sha256(url.encode("utf-8")).hexdigest()
+            )
+            records.append(record)
+            if len(records) >= int(limit):
+                break
         if len(records) >= int(limit):
             break
+    records.sort(key=_sort_key)
     return records
-
-
-def search_spherex_observations(
-    ra_deg: float,
-    dec_deg: float,
-    radius_deg: float = 1.0,
-    collections: tuple[str, ...] = DEFAULT_COLLECTIONS,
-    band: str | None = None,
-    limit_per_collection: int = 100,
-) -> dict[str, list[dict[str, Any]]]:
-    """Search multiple SPHEREx data releases for the same sky region."""
-    return {
-        collection: search_observations(
-            ra_deg, dec_deg, radius_deg, collection, band, limit_per_collection
-        )
-        for collection in collections
-    }
 
 
 def download_observation(
@@ -122,53 +138,69 @@ def download_observation(
     destination: str | Path,
     timeout: tuple[float, float] = (15.0, 180.0),
 ) -> Path:
-    """Download a selected IRSA product safely and verify that it is a FITS file.
-
-    ``observation`` may be a search-result record or its ``access_url``. The
-    destination is replaced only after a complete response passes FITS checks.
-    """
+    """Download a search result or URL; validate FITS before saving atomically."""
     url = observation if isinstance(observation, str) else observation.get("access_url")
     if not isinstance(url, str) or urlparse(url).scheme.lower() not in {"http", "https"}:
-        raise ValueError("The selected observation does not have a valid HTTP(S) access_url.")
-
+        raise ValueError("Observation has no valid HTTP(S) access_url.")
     path = Path(destination).expanduser().resolve()
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary_path: Path | None = None
+    temporary: Path | None = None
     try:
-        with requests.get(url, stream=True, timeout=timeout, headers={"User-Agent": "SPHEREx-Explorer/1.0"}) as response:
+        with requests.get(url, stream=True, timeout=timeout,
+                          headers={"User-Agent": "SPHEREx-Explorer/1.0"}) as response:
             response.raise_for_status()
-            with tempfile.NamedTemporaryFile(dir=path.parent, suffix=".download", delete=False) as temp:
-                temporary_path = Path(temp.name)
+            with tempfile.NamedTemporaryFile(dir=path.parent, suffix=".download", delete=False) as handle:
+                temporary = Path(handle.name)
                 for chunk in response.iter_content(chunk_size=1024 * 1024):
                     if chunk:
-                        temp.write(chunk)
-        with fits.open(temporary_path, memmap=False) as hdus:
+                        handle.write(chunk)
+        with fits.open(temporary, memmap=False) as hdus:
             hdus.verify("exception")
             if not any(hdu.data is not None for hdu in hdus):
-                raise ValueError("The downloaded FITS file contains no data.")
-        os.replace(temporary_path, path)
-        temporary_path = None
+                raise ValueError("Downloaded FITS file has no data.")
+        os.replace(temporary, path)
+        temporary = None
     finally:
-        if temporary_path is not None:
-            temporary_path.unlink(missing_ok=True)
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
     return path
 
 
+def cached_download(
+    observation: Mapping[str, Any], cache_dir: str | Path = DEFAULT_CACHE_DIR
+) -> Path:
+    """Download once per URL into a cache (useful when Streamlit reruns)."""
+    url = observation.get("access_url")
+    if not isinstance(url, str) or not url:
+        raise ValueError("Observation is missing access_url.")
+    cache = Path(cache_dir).expanduser().resolve()
+    path = cache / (hashlib.sha256(url.encode("utf-8")).hexdigest() + ".fits")
+    if path.is_file() and path.stat().st_size:
+        try:
+            with fits.open(path, memmap=False) as hdus:
+                hdus.verify("exception")
+                if any(hdu.data is not None for hdu in hdus):
+                    return path
+        except Exception:
+            path.unlink(missing_ok=True)
+    return download_observation(observation, path)
+
+
 def read_fits_image(path: str | Path) -> tuple[np.ndarray, WCS]:
-    """Read the first usable 2D celestial image and its celestial WCS."""
-    path = Path(path)
+    """Read the first numeric 2-D FITS image with a celestial WCS."""
     with fits.open(path, memmap=False) as hdus:
         for hdu in hdus:
-            data = hdu.data
-            if data is None or np.ndim(data) != 2 or not np.issubdtype(data.dtype, np.number):
+            if hdu.data is None or np.ndim(hdu.data) != 2:
+                continue
+            if not np.issubdtype(hdu.data.dtype, np.number):
                 continue
             wcs = WCS(hdu.header).celestial
             if not wcs.has_celestial:
                 continue
-            image = np.array(data, dtype=np.float64, copy=True)
+            image = np.array(hdu.data, dtype=np.float64, copy=True)
             image[~np.isfinite(image)] = np.nan
             return image, wcs
-    raise ValueError(f"No usable 2D celestial image found in {path}.")
+    raise ValueError(f"No usable 2-D celestial image in {path}.")
 
 
 def compare_images(
@@ -179,111 +211,116 @@ def compare_images(
     coverage_threshold: float = 0.5,
     output_dir: str | Path | None = None,
 ) -> dict[str, Any]:
-    """Reproject and compare FITS images, returning arrays and candidate pixels.
+    """Align comparison to reference and return arrays and candidate records.
 
-    The comparison image is mapped onto the reference image's WCS. A robust
-    median offset is removed only for significance estimation; ``difference``
-    remains the direct comparison-minus-reference image. If ``output_dir`` is
-    supplied, FITS and CSV artifacts are written there.
+    Difference is comparison minus reference. Median offset is removed only for
+    significance calculation. Returned arrays can be plotted by the UI; when
+    output_dir is set, a difference FITS and candidate CSV are also written.
     """
     if not np.isfinite(threshold_sigma) or threshold_sigma <= 0:
-        raise ValueError("threshold_sigma must be a positive finite number.")
+        raise ValueError("threshold_sigma must be positive and finite.")
     if not 0 <= coverage_threshold <= 1:
         raise ValueError("coverage_threshold must be between 0 and 1.")
-
     reference, reference_wcs = read_fits_image(reference_path)
     comparison, comparison_wcs = read_fits_image(comparison_path)
     aligned, footprint = reproject_interp(
-        (comparison, comparison_wcs),
-        reference_wcs,
-        shape_out=reference.shape,
-        return_footprint=True,
+        (comparison, comparison_wcs), reference_wcs,
+        shape_out=reference.shape, return_footprint=True,
     )
-    valid = (
-        np.isfinite(reference)
-        & np.isfinite(aligned)
-        & np.isfinite(footprint)
-        & (footprint > coverage_threshold)
-    )
+    valid = (np.isfinite(reference) & np.isfinite(aligned)
+             & np.isfinite(footprint) & (footprint > coverage_threshold))
     if not np.any(valid):
-        raise ValueError("The two images have no overlapping valid sky coverage.")
+        raise ValueError("The images have no overlapping valid sky coverage.")
 
     difference = np.full(reference.shape, np.nan, dtype=np.float64)
     difference[valid] = aligned[valid] - reference[valid]
-    median_offset = float(np.median(difference[valid]))
+    offset = float(np.median(difference[valid]))
     residual = np.full(reference.shape, np.nan, dtype=np.float64)
-    residual[valid] = difference[valid] - median_offset
+    residual[valid] = difference[valid] - offset
     sigma = float(1.4826 * np.median(np.abs(residual[valid])))
-
-    significance = np.zeros(reference.shape, dtype=np.float64)
+    significance = np.full(reference.shape, np.nan, dtype=np.float64)
     if np.isfinite(sigma) and sigma > 0:
         significance[valid] = residual[valid] / sigma
-    candidate_y, candidate_x = np.where(valid & (np.abs(significance) >= threshold_sigma))
-    candidates = Table(
-        {
-            "x": candidate_x.astype(np.int64),
-            "y": candidate_y.astype(np.int64),
-            "difference": difference[candidate_y, candidate_x],
-            "significance_sigma": significance[candidate_y, candidate_x],
-        }
-    )
+        yy, xx = np.where(valid & (np.abs(significance) >= threshold_sigma))
+    else:
+        # A zero robust scatter cannot support a meaningful sigma threshold.
+        yy, xx = np.array([], dtype=int), np.array([], dtype=int)
+    candidates = [
+        {"x": int(x), "y": int(y), "difference": float(difference[y, x]),
+         "significance_sigma": float(significance[y, x])}
+        for y, x in zip(yy, xx)
+    ]
 
     artifacts: dict[str, str] = {}
     if output_dir is not None:
-        destination = Path(output_dir).expanduser().resolve()
-        destination.mkdir(parents=True, exist_ok=True)
-        difference_path = destination / "difference.fits"
+        folder = Path(output_dir).expanduser().resolve()
+        folder.mkdir(parents=True, exist_ok=True)
+        diff_path = folder / "difference.fits"
         fits.PrimaryHDU(data=difference, header=reference_wcs.to_header()).writeto(
-            difference_path, overwrite=True
+            diff_path, overwrite=True
         )
-        candidates_path = destination / "pixels_candidats.csv"
-        candidates.write(candidates_path, format="ascii.csv", overwrite=True)
-        artifacts = {"difference_fits": str(difference_path), "candidates_csv": str(candidates_path)}
+        csv_path = folder / "pixels_candidats.csv"
+        Table(rows=candidates, names=("x", "y", "difference", "significance_sigma")).write(
+            csv_path, format="ascii.csv", overwrite=True
+        )
+        artifacts = {"difference_fits": str(diff_path), "candidates_csv": str(csv_path)}
 
     return {
-        "reference": reference,
-        "aligned_comparison": aligned,
-        "coverage": footprint,
-        "valid_mask": valid,
-        "difference": difference,
-        "residual": residual,
-        "significance": significance,
-        "candidates": candidates,
-        "median_offset": median_offset,
-        "robust_sigma": sigma,
+        "reference": reference, "aligned_comparison": aligned,
+        "coverage": footprint, "valid_mask": valid,
+        "difference": difference, "residual": residual,
+        "significance": significance, "candidates": candidates,
+        "median_offset": offset, "robust_sigma": sigma,
         "valid_pixel_count": int(np.count_nonzero(valid)),
-        "candidate_count": len(candidates),
-        "threshold_sigma": float(threshold_sigma),
+        "candidate_count": len(candidates), "threshold_sigma": float(threshold_sigma),
         "artifacts": artifacts,
-        "warning": (
-            "Exploratory pixel-level comparison only. Verify matching band, units, "
-            "calibration, masks, and epochs; candidates are not confirmed sources."
-        ),
+        "warning": ("Exploratory pixel-level comparison only. Confirm matching band, units, "
+                    "calibration, masks, and epochs; candidates are not confirmed sources."),
     }
 
 
-# French aliases retained for compatibility with the first script version.
-def rechercher(collection: str, position: SkyCoord, rayon: u.Quantity) -> Table:
-    """Legacy raw-table search; new interface code should use search_observations."""
-    return Irsa.query_sia(pos=(position, rayon), collection=collection)
-
-
-def telecharger(table: Table | Mapping[str, Any] | str, index: int | str, chemin: str | Path) -> Path:
-    """Legacy-compatible download wrapper."""
-    observation = table[int(index)] if isinstance(table, Table) else table
-    return download_observation(observation, chemin)
-
-
-def lire_image_fits(chemin: str | Path) -> tuple[np.ndarray, WCS]:
-    return read_fits_image(chemin)
-
-
-def comparer_images(fichier1: str | Path, fichier2: str | Path) -> dict[str, Any]:
-    result = compare_images(fichier1, fichier2, output_dir=DATA_DIR)
-    print(
-        f"{result['candidate_count']} pixels candidats au seuil "
-        f"de {result['threshold_sigma']:g} sigma."
+def compare_observations(
+    earlier: Mapping[str, Any],
+    later: Mapping[str, Any],
+    *,
+    cache_dir: str | Path = DEFAULT_CACHE_DIR,
+    output_dir: str | Path | None = None,
+    threshold_sigma: float = 5.0,
+) -> dict[str, Any]:
+    """Download/cache and compare two observations selected by the interface."""
+    if earlier.get("observation_id") == later.get("observation_id"):
+        raise ValueError("Select two different observations.")
+    band_a, band_b = earlier.get("band_value"), later.get("band_value")
+    if band_a and band_b and str(band_a).casefold() != str(band_b).casefold():
+        raise ValueError(f"Different bands cannot be directly compared ({band_a!r}, {band_b!r}).")
+    result = compare_images(
+        cached_download(earlier, cache_dir), cached_download(later, cache_dir),
+        threshold_sigma=threshold_sigma, output_dir=output_dir,
     )
-    print(result["artifacts"])
-    print(result["warning"])
+    result["earlier_observation"] = dict(earlier)
+    result["later_observation"] = dict(later)
     return result
+
+
+def compare_timeline(
+    observations: Sequence[Mapping[str, Any]],
+    *,
+    cache_dir: str | Path = DEFAULT_CACHE_DIR,
+    output_dir: str | Path | None = None,
+    threshold_sigma: float = 5.0,
+) -> list[dict[str, Any]]:
+    """Compare each adjacent pair of observations after chronological sorting."""
+    ordered = sorted(observations, key=_sort_key)
+    if len(ordered) < 2:
+        raise ValueError("At least two observations are needed.")
+    results = []
+    for first, second in zip(ordered, ordered[1:]):
+        pair_dir = None
+        if output_dir is not None:
+            pair_key = f"{first.get('observation_id', '')}-{second.get('observation_id', '')}"
+            pair_dir = Path(output_dir) / hashlib.sha256(pair_key.encode("utf-8")).hexdigest()[:16]
+        results.append(compare_observations(
+            first, second, cache_dir=cache_dir,
+            output_dir=pair_dir, threshold_sigma=threshold_sigma,
+        ))
+    return results
