@@ -1,0 +1,278 @@
+import streamlit as st
+import streamlit.components.v1 as components
+
+def exploration_mode():
+
+st.title("SPHEREx Explorer")
+st.write("Explore the Universe freely from your spaceship.")
+
+# Création de la vue astronomique interactive
+
+html = """
+<!DOCTYPE html>
+<html>
+
+<head>
+
+    <script src="https://aladin.cds.unistra.fr/AladinLite/api/v3/latest/aladin.js"></script>
+
+    <style>
+
+        body {
+            margin: 0;
+            background: #050B18;
+            font-family: Arial, sans-serif;
+            color: white;
+        }
+
+        #cockpit {
+            position: relative;
+            width: 100%;
+            height: 650px;
+            border: 2px solid #00BFFF;
+            border-radius: 12px;
+            overflow: hidden;
+        }
+
+        #aladin-lite-div {
+            width: 100%;
+            height: 100%;
+        }
+
+        /* Création du viseur central */
+
+        #crosshair {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            width: 44px;
+            height: 44px;
+            transform: translate(-50%, -50%);
+            pointer-events: none;
+            z-index: 20;
+        }
+
+        #crosshair::before {
+            content: "";
+            position: absolute;
+            width: 2px;
+            height: 44px;
+            background: #00E5FF;
+            left: 21px;
+        }
+
+        #crosshair::after {
+            content: "";
+            position: absolute;
+            height: 2px;
+            width: 44px;
+            background: #00E5FF;
+            top: 21px;
+        }
+
+        /* Panneau des coordonnées */
+
+        #coordinates {
+            position: absolute;
+            top: 15px;
+            left: 15px;
+            background: rgba(0, 10, 25, 0.9);
+            border: 1px solid #00BFFF;
+            border-radius: 8px;
+            padding: 12px;
+            z-index: 20;
+            font-size: 13px;
+            line-height: 1.8;
+            pointer-events: none;
+        }
+
+        /* Panneau des objets célestes */
+
+        #objects {
+            position: absolute;
+            bottom: 15px;
+            left: 15px;
+            width: 250px;
+            max-height: 180px;
+            overflow-y: auto;
+            background: rgba(0, 10, 25, 0.9);
+            border: 1px solid #00BFFF;
+            border-radius: 8px;
+            padding: 12px;
+            z-index: 20;
+            font-size: 12px;
+            pointer-events: none;
+        }
+
+        .blue {
+            color: #00E5FF;
+        }
+
+    </style>
+
+</head>
+
+<body>
+
+    <div id="cockpit">
+
+        <div id="aladin-lite-div"></div>
+
+        <div id="crosshair"></div>
+
+        <div id="coordinates">
+            <strong class="blue">NAVIGATION SYSTEM</strong>
+            <div id="ra">RA: Loading...</div>
+            <div id="dec">DEC: Loading...</div>
+            <div id="fov">FOV: Loading...</div>
+        </div>
+
+        <div id="objects">
+            <strong class="blue">CELESTIAL OBJECTS</strong>
+            <div id="object-list">
+                Searching the sky...
+            </div>
+        </div>
+
+    </div>
+
+    <script>
+
+    A.init.then(() => {
+
+        // Initialisation de la carte du ciel
+
+        const aladin = A.aladin(
+            '#aladin-lite-div',
+            {
+                target: '10.684 41.269',
+                fov: 2,
+                cooFrame: 'ICRS',
+                showReticle: false,
+                showCooGrid: true,
+                showZoomControl: true,
+                showFullscreenControl: true,
+                showContextMenu: true
+            }
+        );
+
+        let searchTimer = null;
+
+        // Mise à jour des coordonnées du viseur
+
+        function updateCoordinates() {
+
+            const position = aladin.getRaDec();
+            const field = aladin.getFov();
+
+            document.getElementById("ra").innerHTML =
+                "RA: " + position[0].toFixed(5) + "°";
+
+            document.getElementById("dec").innerHTML =
+                "DEC: " + position[1].toFixed(5) + "°";
+
+            document.getElementById("fov").innerHTML =
+                "FOV: " + field[0].toFixed(3) + "°";
+        }
+
+        // Recherche des objets dans le catalogue SIMBAD
+
+        function identifyObjects() {
+
+            const position = aladin.getRaDec();
+            const field = aladin.getFov();
+
+            const radius = Math.min(
+                2,
+                Math.max(field[0], field[1]) / 2
+            );
+
+            document.getElementById("object-list").innerHTML =
+                "Searching nearby objects...";
+
+            // Supprimer les anciens catalogues affichés
+
+            aladin.removeLayers();
+
+            // Interroger SIMBAD autour du viseur
+
+            A.catalogFromSimbad(
+                {
+                    ra: position[0],
+                    dec: position[1]
+                },
+                radius,
+                {
+                    limit: 100,
+                    color: '#00E5FF',
+                    sourceSize: 8,
+                    displayLabel: true,
+                    labelColumn: 'main_id',
+                    labelColor: '#FFFFFF',
+                    labelFont: '11px Arial',
+                    onClick: 'showPopup'
+                },
+                function(catalog) {
+
+                    aladin.addCatalog(catalog);
+
+                    document.getElementById(
+                        "object-list"
+                    ).innerHTML =
+                        "Objects found in the selected region.<br>" +
+                        "Click on a catalog object to see its name and information.";
+
+                }
+            );
+
+        }
+
+        // Actualiser les coordonnées quand le ciel bouge
+
+        aladin.on('positionChanged', function() {
+
+            updateCoordinates();
+
+            // Attendre la fin du déplacement
+            // avant de rechercher les objets
+
+            clearTimeout(searchTimer);
+
+            searchTimer = setTimeout(
+                identifyObjects,
+                1200
+            );
+
+        });
+
+        // Actualiser également après un changement de zoom
+
+        aladin.on('zoomChanged', function() {
+
+            updateCoordinates();
+
+            clearTimeout(searchTimer);
+
+            searchTimer = setTimeout(
+                identifyObjects,
+                1200
+            );
+
+        });
+
+        // Premier affichage
+
+        updateCoordinates();
+
+        identifyObjects();
+
+    });
+
+    </script>
+
+</body>
+
+</html>
+"""
+
+components.html(html, height=670, scrolling=False)
