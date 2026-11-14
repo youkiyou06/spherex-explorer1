@@ -1,7 +1,0 @@
-streamlit
-astroquery
-astropy
-numpy
-requests
-matplotlib
-pandas
