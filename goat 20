@@ -1,0 +1,1138 @@
+
+from __future__ import annotations
+
+import json
+import hashlib
+import tempfile
+from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+import streamlit as st
+import numpy as np
+import pandas as pd
+import s3fs
+import imageio.v2 as imageio
+import matplotlib.pyplot as plt
+
+from astropy.io import fits
+from astropy.time import Time
+from astropy.coordinates import SkyCoord
+from astropy.wcs import WCS
+from astropy.nddata import Cutout2D
+from astropy import units as u
+
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+BUCKET = "nasa-irsa-spherex"
+REGION = "us-east-1"
+
+CACHE_DIR = Path("spherex_cache")
+CACHE_DIR.mkdir(exist_ok=True)
+
+BACKGROUND = "#07152f"
+YELLOW = "#e8c547"
+
+st.set_page_config(
+    page_title="SPHEREx Explorer",
+    page_icon="🌌",
+    layout="wide"
+)
+
+
+# ============================================================
+# STYLE
+# ============================================================
+
+st.markdown(
+    f"""
+    <style>
+    .stApp {{
+        background-color: {BACKGROUND};
+        color: white;
+    }}
+
+    h1, h2, h3 {{
+        color: {YELLOW} !important;
+    }}
+
+    p, label, span {{
+        color: white;
+    }}
+
+    .main-title {{
+        text-align: center;
+        font-size: 46px;
+        font-weight: 800;
+        color: {YELLOW};
+        padding-top: 15px;
+    }}
+
+    .subtitle {{
+        text-align: center;
+        font-size: 17px;
+        color: #c8d4e8;
+        margin-bottom: 35px;
+    }}
+
+    .info-box {{
+        background-color: #10264b;
+        border: 1px solid #344b70;
+        border-radius: 12px;
+        padding: 20px;
+        margin: 15px 0;
+    }}
+
+    div.stButton > button {{
+        background-color: {YELLOW};
+        color: #07152f;
+        border-radius: 10px;
+        border: none;
+        font-weight: bold;
+        min-height: 45px;
+    }}
+
+    div.stButton > button:hover {{
+        background-color: #ffdf65;
+        color: #07152f;
+    }}
+    </style>
+    """,
+    unsafe_allow_html=True
+)
+
+
+# ============================================================
+# AWS CONNECTION
+# ============================================================
+
+@st.cache_resource
+def get_fs():
+
+    return s3fs.S3FileSystem(
+        anon=True,
+        client_kwargs={
+            "region_name": REGION
+        }
+    )
+
+
+# ============================================================
+# LIST PLANNING PERIODS
+# ============================================================
+
+@st.cache_data(ttl=3600)
+def get_periods(release):
+
+    fs = get_fs()
+
+    root = f"{BUCKET}/{release}/level2"
+
+    directories = fs.ls(
+        root,
+        detail=False
+    )
+
+    periods = []
+
+    for directory in directories:
+
+        name = directory.rstrip("/").split("/")[-1]
+
+        if name:
+            periods.append(name)
+
+    return sorted(periods)
+
+
+# ============================================================
+# LIST ALL FITS FILES
+# ============================================================
+
+@st.cache_data(ttl=3600)
+def list_all_fits(release, selected_periods):
+
+    fs = get_fs()
+
+    all_files = []
+
+    for period in selected_periods:
+
+        prefix = (
+            f"{BUCKET}/{release}/level2/{period}"
+        )
+
+        files = fs.find(prefix)
+
+        for filename in files:
+
+            if filename.lower().endswith(
+                (".fits", ".fits.gz")
+            ):
+
+                all_files.append(filename)
+
+    return sorted(set(all_files))
+
+
+# ============================================================
+# DATE EXTRACTION
+# ============================================================
+
+def extract_date(header):
+
+    date_keys = [
+        "DATE-AVG",
+        "DATE-OBS",
+        "DATE-BEG",
+        "MJD-AVG",
+        "MJD-OBS"
+    ]
+
+    for key in date_keys:
+
+        if key not in header:
+            continue
+
+        try:
+
+            value = header[key]
+
+            if key.startswith("MJD"):
+
+                return Time(
+                    float(value),
+                    format="mjd"
+                ).datetime.isoformat()
+
+            return Time(
+                str(value)
+            ).datetime.isoformat()
+
+        except Exception:
+            continue
+
+    return None
+
+
+# ============================================================
+# INSPECT ONE FITS FILE
+# ============================================================
+
+def inspect_fits_file(
+    filename,
+    ra,
+    dec,
+    radius
+):
+
+    fs = get_fs()
+
+    target = SkyCoord(
+        ra=ra * u.deg,
+        dec=dec * u.deg,
+        frame="icrs"
+    )
+
+    try:
+
+        with fs.open(filename, "rb") as remote_file:
+
+            with fits.open(
+                remote_file,
+                lazy_load_hdus=True,
+                memmap=False
+            ) as hdul:
+
+                candidates = sorted(
+                    list(enumerate(hdul)),
+                    key=lambda item: (
+                        item[1].name != "IMAGE"
+                    )
+                )
+
+                for index, hdu in candidates:
+
+                    header = hdu.header
+
+                    if header.get("NAXIS", 0) < 2:
+                        continue
+
+                    if (
+                        "NAXIS1" not in header
+                        or "NAXIS2" not in header
+                    ):
+                        continue
+
+                    try:
+
+                        wcs = WCS(
+                            header
+                        ).celestial
+
+                        if not wcs.has_celestial:
+                            continue
+
+                        width = int(header["NAXIS1"])
+                        height = int(header["NAXIS2"])
+
+                        x, y = wcs.world_to_pixel(target)
+
+                        if (
+                            not np.isfinite(x)
+                            or not np.isfinite(y)
+                        ):
+                            continue
+
+                        scales = np.abs(
+                            wcs.proj_plane_pixel_scales().to_value(
+                                u.deg
+                            )
+                        )
+
+                        pixel_scale = float(
+                            np.mean(scales)
+                        )
+
+                        margin = (
+                            radius /
+                            max(pixel_scale, 1e-8)
+                        )
+
+                        if not (
+                            -margin <= x <= width + margin
+                            and -margin <= y <= height + margin
+                        ):
+                            continue
+
+                        date = (
+                            extract_date(header)
+                            or extract_date(hdul[0].header)
+                        )
+
+                        if date is None:
+                            continue
+
+                        band = (
+                            header.get("BANDPASS")
+                            or header.get("BAND")
+                            or header.get("BANDNUM")
+                            or hdul[0].header.get(
+                                "BANDPASS",
+                                "Unknown"
+                            )
+                        )
+
+                        return {
+                            "key": filename,
+                            "date": date,
+                            "band": str(band),
+                            "hdu": index
+                        }
+
+                    except Exception:
+                        continue
+
+    except Exception:
+        return None
+
+    return None
+
+
+# ============================================================
+# CACHE IDENTIFICATION
+# ============================================================
+
+def get_search_cache_path(
+    release,
+    periods,
+    ra,
+    dec,
+    radius
+):
+
+    parameters = {
+        "release": release,
+        "periods": sorted(periods),
+        "ra": round(float(ra), 6),
+        "dec": round(float(dec), 6),
+        "radius": round(float(radius), 6)
+    }
+
+    encoded = json.dumps(
+        parameters,
+        sort_keys=True
+    ).encode("utf-8")
+
+    digest = hashlib.sha256(
+        encoded
+    ).hexdigest()
+
+    return CACHE_DIR / f"search_{digest}.json"
+
+
+# ============================================================
+# SEARCH ARCHIVE WITH LOCAL CACHE
+# ============================================================
+
+def search_archive(
+    release,
+    periods,
+    ra,
+    dec,
+    radius
+):
+
+    cache_file = get_search_cache_path(
+        release,
+        periods,
+        ra,
+        dec,
+        radius
+    )
+
+    # 1. CHECK CACHE
+
+    if cache_file.exists():
+
+        try:
+
+            with open(
+                cache_file,
+                "r",
+                encoding="utf-8"
+            ) as file:
+
+                cached = json.load(file)
+
+            st.success(
+                "Results loaded from local cache."
+            )
+
+            return cached["records"], cached["total"]
+
+        except Exception:
+
+            cache_file.unlink(
+                missing_ok=True
+            )
+
+    # 2. LIST FILES
+
+    files = list_all_fits(
+        release,
+        tuple(periods)
+    )
+
+    total = len(files)
+
+    if total == 0:
+        return [], 0
+
+    # 3. INSPECT FILES
+
+    results = []
+
+    progress = st.progress(0)
+    status = st.empty()
+
+    workers = 8
+    completed = 0
+
+    with ThreadPoolExecutor(
+        max_workers=workers
+    ) as executor:
+
+        futures = [
+            executor.submit(
+                inspect_fits_file,
+                filename,
+                ra,
+                dec,
+                radius
+            )
+            for filename in files
+        ]
+
+        for future in as_completed(futures):
+
+            completed += 1
+
+            try:
+
+                result = future.result()
+
+                if result is not None:
+                    results.append(result)
+
+            except Exception:
+                pass
+
+            if completed % 20 == 0 or completed == total:
+
+                status.write(
+                    f"AWS inspection: {completed}/{total} "
+                    f"| Observations found: {len(results)}"
+                )
+
+                progress.progress(
+                    completed / total
+                )
+
+    progress.empty()
+    status.empty()
+
+    # 4. SORT CHRONOLOGICALLY
+
+    results.sort(
+        key=lambda item: item["date"]
+    )
+
+    # 5. SAVE CACHE
+
+    cache_data = {
+        "records": results,
+        "total": total
+    }
+
+    temporary_cache = cache_file.with_suffix(".tmp")
+
+    with open(
+        temporary_cache,
+        "w",
+        encoding="utf-8"
+    ) as file:
+
+        json.dump(
+            cache_data,
+            file,
+            ensure_ascii=False
+        )
+
+    temporary_cache.replace(
+        cache_file
+    )
+
+    return results, total
+
+
+# ============================================================
+# DOWNLOAD IMAGE
+# ============================================================
+
+def download_image(
+    record,
+    ra,
+    dec,
+    radius
+):
+
+    fs = get_fs()
+
+    target = SkyCoord(
+        ra=ra * u.deg,
+        dec=dec * u.deg,
+        frame="icrs"
+    )
+
+    with fs.open(
+        record["key"],
+        "rb"
+    ) as remote_file:
+
+        with fits.open(
+            remote_file,
+            memmap=False
+        ) as hdul:
+
+            hdu = hdul[record["hdu"]]
+
+            data = np.asarray(
+                hdu.data,
+                dtype=np.float32
+            )
+
+            wcs = WCS(
+                hdu.header
+            ).celestial
+
+            cutout = Cutout2D(
+                data,
+                position=target,
+                size=(
+                    radius * 2 * u.deg,
+                    radius * 2 * u.deg
+                ),
+                wcs=wcs,
+                mode="partial",
+                fill_value=np.nan
+            )
+
+            return cutout.data
+
+
+# ============================================================
+# BUILD VIDEO
+# ============================================================
+
+def create_video(
+    records,
+    ra,
+    dec,
+    radius,
+    fps
+):
+
+    images = []
+
+    progress = st.progress(0)
+    status = st.empty()
+
+    for index, record in enumerate(records):
+
+        status.write(
+            f"Downloading image {index + 1}/{len(records)}"
+        )
+
+        try:
+
+            image = download_image(
+                record,
+                ra,
+                dec,
+                radius
+            )
+
+            if not np.isfinite(image).any():
+                continue
+
+            images.append({
+                "data": image,
+                "date": record["date"],
+                "band": record["band"]
+            })
+
+        except Exception as error:
+
+            st.warning(
+                f"Image skipped: {error}"
+            )
+
+        progress.progress(
+            (index + 1) / len(records)
+        )
+
+    progress.empty()
+    status.empty()
+
+    if len(images) < 2:
+
+        raise ValueError(
+            "At least two usable images are required."
+        )
+
+    # COMMON INTENSITY SCALE
+
+    values = np.concatenate([
+        item["data"][
+            np.isfinite(item["data"])
+        ]
+        for item in images
+    ])
+
+    low, high = np.percentile(
+        values,
+        [1, 99]
+    )
+
+    frames = []
+
+    for item in images:
+
+        data = np.nan_to_num(
+            item["data"],
+            nan=low,
+            posinf=high,
+            neginf=low
+        )
+
+        normalized = np.clip(
+            (data - low) / max(high - low, 1e-8),
+            0,
+            1
+        )
+
+        fig, ax = plt.subplots(
+            figsize=(6, 6),
+            dpi=100
+        )
+
+        ax.imshow(
+            normalized,
+            cmap="gray",
+            origin="lower"
+        )
+
+        ax.set_title(
+            f"SPHEREx | {item['date']}",
+            color="white",
+            fontsize=9
+        )
+
+        ax.text(
+            0.5,
+            0.02,
+            f"Band: {item['band']}",
+            transform=ax.transAxes,
+            color="yellow",
+            ha="center"
+        )
+
+        ax.set_axis_off()
+
+        fig.patch.set_facecolor(
+            BACKGROUND
+        )
+
+        fig.canvas.draw()
+
+        frame = np.asarray(
+            fig.canvas.buffer_rgba()
+        )[:, :, :3].copy()
+
+        frames.append(frame)
+
+        plt.close(fig)
+
+    with tempfile.NamedTemporaryFile(
+        suffix=".mp4",
+        delete=False
+    ) as temporary:
+
+        filename = temporary.name
+
+    try:
+
+        imageio.mimsave(
+            filename,
+            frames,
+            fps=fps,
+            codec="libx264",
+            quality=8
+        )
+
+        with open(filename, "rb") as file:
+            video = file.read()
+
+    finally:
+
+        Path(filename).unlink(
+            missing_ok=True
+        )
+
+    return video
+
+
+# ============================================================
+# SESSION STATE
+# ============================================================
+
+if "mode" not in st.session_state:
+    st.session_state.mode = "home"
+
+if "observations" not in st.session_state:
+    st.session_state.observations = []
+
+if "video" not in st.session_state:
+    st.session_state.video = None
+
+if "search_parameters" not in st.session_state:
+    st.session_state.search_parameters = None
+
+
+# ============================================================
+# HOME
+# ============================================================
+
+def home_page():
+
+    st.markdown(
+        '<div class="main-title">SPHEREx EXPLORER</div>',
+        unsafe_allow_html=True
+    )
+
+    st.markdown(
+        '<div class="subtitle">'
+        'Explore the infrared universe through time and space'
+        '</div>',
+        unsafe_allow_html=True
+    )
+
+    st.markdown(
+        """
+        <div class="info-box">
+        <h3>🌌 Discover the SPHEREx universe</h3>
+        Explore real observations collected by NASA's SPHEREx mission.
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+
+        st.markdown(
+            """
+            <div class="info-box">
+            <h3>⏳ Temporal exploration</h3>
+            Follow the same region of the sky through different dates.
+            Generate a video from real FITS observations.
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
+
+        if st.button(
+            "OPEN TEMPORAL EXPLORATION",
+            use_container_width=True
+        ):
+
+            st.session_state.mode = "temporal"
+            st.rerun()
+
+    with col2:
+
+        st.markdown(
+            """
+            <div class="info-box">
+            <h3>🔭 Free exploration</h3>
+            Navigate freely around the sky.
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
+
+        if st.button(
+            "OPEN FREE EXPLORATION",
+            use_container_width=True
+        ):
+
+            st.session_state.mode = "free"
+            st.rerun()
+
+
+# ============================================================
+# TEMPORAL EXPLORATION
+# ============================================================
+
+def temporal_page():
+
+    if st.button("← BACK TO HOME"):
+
+        st.session_state.mode = "home"
+        st.rerun()
+
+    st.title("⏳ Temporal exploration")
+
+    st.write(
+        "Search the public AWS archive directly. "
+        "No IRSA TAP or SIA request is used."
+    )
+
+    st.markdown(
+        """
+        <div class="info-box">
+        Every selected FITS file is inspected.
+        The application checks its celestial WCS header
+        to determine whether it covers your selected coordinates.
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
+    # CACHE MANAGEMENT
+
+    if st.button("CLEAR LOCAL SEARCH CACHE"):
+
+        for cache_file in CACHE_DIR.glob("search_*.json"):
+            cache_file.unlink(missing_ok=True)
+
+        st.session_state.observations = []
+        st.session_state.video = None
+        st.session_state.search_parameters = None
+
+        st.success("Local search cache cleared.")
+
+    st.subheader("1. Select sky coordinates")
+
+    col1, col2, col3 = st.columns(3)
+
+    with col1:
+
+        ra = st.number_input(
+            "Right ascension (degrees)",
+            min_value=0.0,
+            max_value=360.0,
+            value=83.633
+        )
+
+    with col2:
+
+        dec = st.number_input(
+            "Declination (degrees)",
+            min_value=-90.0,
+            max_value=90.0,
+            value=22.014
+        )
+
+    with col3:
+
+        radius = st.number_input(
+            "Search radius (degrees)",
+            min_value=0.01,
+            max_value=2.0,
+            value=0.2
+        )
+
+    st.subheader("2. Select release")
+
+    release = st.selectbox(
+        "Data release",
+        ["dr1", "qr3"]
+    )
+
+    try:
+
+        periods = get_periods(release)
+
+        if not periods:
+
+            st.error(
+                "No planning periods found in AWS."
+            )
+
+            return
+
+        selected_periods = st.multiselect(
+            "Planning periods",
+            periods,
+            default=periods
+        )
+
+    except Exception as error:
+
+        st.error(
+            f"AWS directory access failed: {error}"
+        )
+
+        return
+
+    st.info(
+        f"{len(selected_periods)} planning period(s) selected. "
+        "All FITS files in these periods will be inspected "
+        "on the first search."
+    )
+
+    st.subheader("3. Search archive")
+
+    if st.button(
+        "SEARCH ALL SELECTED FITS FILES",
+        use_container_width=True
+    ):
+
+        if not selected_periods:
+
+            st.warning(
+                "Select at least one planning period."
+            )
+
+        else:
+
+            st.session_state.observations = []
+            st.session_state.video = None
+
+            parameters = {
+                "release": release,
+                "periods": sorted(selected_periods),
+                "ra": round(float(ra), 6),
+                "dec": round(float(dec), 6),
+                "radius": round(float(radius), 6)
+            }
+
+            try:
+
+                records, total = search_archive(
+                    release,
+                    selected_periods,
+                    ra,
+                    dec,
+                    radius
+                )
+
+                st.session_state.observations = records
+                st.session_state.search_parameters = parameters
+
+                st.success(
+                    f"{len(records)} observations found "
+                    f"among {total} FITS files."
+                )
+
+            except Exception as error:
+
+                st.error(
+                    f"Archive search failed: {error}"
+                )
+
+    records = st.session_state.observations
+
+    current_parameters = {
+        "release": release,
+        "periods": sorted(selected_periods),
+        "ra": round(float(ra), 6),
+        "dec": round(float(dec), 6),
+        "radius": round(float(radius), 6)
+    }
+
+    # Do not reuse results if the user changes coordinates.
+
+    if (
+        records
+        and st.session_state.search_parameters
+        != current_parameters
+    ):
+
+        st.warning(
+            "The search parameters have changed. "
+            "Run a new search before generating a video."
+        )
+
+        return
+
+    if records:
+
+        st.subheader("4. Observations")
+
+        table = pd.DataFrame([
+            {
+                "Date": item["date"],
+                "Spectral band": item["band"],
+                "FITS file": item["key"].split("/")[-1]
+            }
+            for item in records
+        ])
+
+        st.dataframe(
+            table,
+            use_container_width=True,
+            hide_index=True
+        )
+
+        st.subheader("5. Create temporal video")
+
+        max_images = st.slider(
+            "Number of images to download",
+            min_value=2,
+            max_value=min(30, len(records)),
+            value=min(10, len(records))
+        )
+
+        fps = st.slider(
+            "Playback speed",
+            min_value=1,
+            max_value=5,
+            value=2
+        )
+
+        if st.button(
+            "GENERATE VIDEO",
+            use_container_width=True
+        ):
+
+            try:
+
+                video = create_video(
+                    records[:max_images],
+                    ra,
+                    dec,
+                    radius,
+                    fps
+                )
+
+                st.session_state.video = video
+
+                st.success(
+                    "Video successfully created."
+                )
+
+            except Exception as error:
+
+                st.session_state.video = None
+
+                st.error(
+                    f"Video generation failed: {error}"
+                )
+
+        if st.session_state.video:
+
+            st.subheader("6. Playback")
+
+            st.video(
+                st.session_state.video
+            )
+
+            st.download_button(
+                "DOWNLOAD VIDEO",
+                data=st.session_state.video,
+                file_name="spherex_temporal_exploration.mp4",
+                mime="video/mp4",
+                use_container_width=True
+            )
+
+
+# ============================================================
+# FREE EXPLORATION
+# ============================================================
+
+def free_page():
+
+    if st.button("← BACK TO HOME"):
+
+        st.session_state.mode = "home"
+        st.rerun()
+
+    st.title("🔭 Free sky exploration")
+
+    st.markdown(
+        """
+        <div class="info-box">
+        Navigate freely around the sky with Stellarium Web.
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
+    st.components.v1.iframe(
+        "https://stellarium-web.org/",
+        height=700,
+        scrolling=True
+    )
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+if st.session_state.mode == "home":
+
+    home_page()
+
+elif st.session_state.mode == "temporal":
+
+    temporal_page()
+
+elif st.session_state.mode == "free":
+
+    free_page()
