@@ -1,7 +1,7 @@
 """Recherche et téléchargement de produits FITS SPHEREx depuis IRSA.
 
 Installation (Python 3.13 conseillé) :
-    python -m pip install requests astroquery astropy
+    python -m pip install requests astroquery astropy matplotlib
 
 Le service SIA d'IRSA est interrogé par Astroquery. Les progrès sont affichés
 pour distinguer une recherche en cours d'un programme bloqué.
@@ -11,12 +11,16 @@ Le script supporte maintenant un filtrage additionnel sur la bande spectrale
 """
 
 import re
+from io import BytesIO
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
+import matplotlib.pyplot as plt
+import numpy as np
 import requests
 from astropy import units as u
 from astropy.coordinates import SkyCoord
+from astropy.io import fits
 from astropy.utils.data import conf as astropy_conf
 from astroquery.ipac.irsa import Irsa
 
@@ -77,8 +81,48 @@ def _applique_filtres_resultats(resultats, band_wave_um=None, time_mjd=None):
     return resultats
 
 
+def afficher_fits(url, numero):
+    """Télécharge un FITS en mémoire et l'affiche dans une fenêtre matplotlib."""
+    with requests.get(url, timeout=(20, 180), stream=True, allow_redirects=True) as response:
+        response.raise_for_status()
+        contenu = response.content
+
+    if not contenu:
+        raise ValueError("Le téléchargement du FITS est vide.")
+
+    with fits.open(BytesIO(contenu), memmap=False) as hdul:
+        image_hdu = next(
+            (hdu for hdu in hdul if getattr(hdu, "data", None) is not None and np.ndim(hdu.data) >= 2),
+            None,
+        )
+        if image_hdu is None:
+            raise ValueError("Aucune image exploitable n'a été trouvée dans ce FITS.")
+
+        image = np.asarray(image_hdu.data, dtype=np.float32)
+        while image.ndim > 2:
+            image = image[0]
+
+        masque = np.isfinite(image)
+        if not masque.any():
+            raise ValueError("L'image ne contient aucune valeur finie.")
+
+        vmin, vmax = np.percentile(image[masque], [1, 99])
+        if vmin == vmax:
+            vmin, vmax = np.min(image[masque]), np.max(image[masque])
+            if vmin == vmax:
+                vmin = vmax - 1
+
+        fig, ax = plt.subplots(figsize=(8, 8))
+        im = ax.imshow(image, origin="lower", cmap="gray", vmin=vmin, vmax=vmax)
+        fig.colorbar(im, ax=ax, label="Valeur du pixel")
+        ax.set_title(f"Produit SPHEREx {numero}")
+        ax.set_xlabel("X")
+        ax.set_ylabel("Y")
+        plt.show()
+
+
 def rechercher_image(ra, dec, rayon_deg=0.1, dossier="spherex_images", band_wave_um=None, time_mjd=None):
-    """Télécharge le premier produit FITS SPHEREx trouvé autour de la position.
+    """Affiche le premier produit FITS SPHEREx trouvé autour de la position.
 
     band_wave_um: tuple (min_um, max_um) ou None
     time_mjd: tuple (min_mjd, max_mjd) ou None
@@ -128,8 +172,6 @@ def rechercher_image(ra, dec, rayon_deg=0.1, dossier="spherex_images", band_wave
     if "access_url" not in resultats.colnames:
         raise LookupError(f"La réponse IRSA ne contient pas access_url : {resultats.colnames}")
 
-    destination = Path(dossier)
-    destination.mkdir(parents=True, exist_ok=True)
     erreurs = []
 
     for numero, ligne in enumerate(resultats, start=1):
@@ -140,41 +182,16 @@ def rechercher_image(ra, dec, rayon_deg=0.1, dossier="spherex_images", band_wave
         if not url or url.lower() == "masked":
             continue
 
-        print(f"Téléchargement du produit {numero}/{nombre}…", flush=True)
-        chemin_temp = None
+        print(f"Affichage du produit {numero}/{nombre}…", flush=True)
         try:
-            with requests.get(url, timeout=(20, 180), stream=True, allow_redirects=True) as response:
-                response.raise_for_status()
-                nom = Path(unquote(urlparse(response.url).path)).name or f"spherex_{numero}.fits"
-                nom = re.sub(r"[^A-Za-z0-9._-]", "_", nom)
-                if not nom.lower().endswith((".fits", ".fits.gz", ".fit", ".fit.gz")):
-                    nom += ".fits"
-                chemin = destination / nom
-                chemin_temp = chemin.with_name(chemin.name + ".part")
-
-                debut = bytearray()
-                with chemin_temp.open("wb") as fichier:
-                    for bloc in response.iter_content(chunk_size=1024 * 1024):
-                        if bloc:
-                            if len(debut) < 80:
-                                debut.extend(bloc[: 80 - len(debut)])
-                            fichier.write(bloc)
-
-            if not _est_fits(bytes(debut)):
-                raise ValueError(
-                    "La réponse téléchargée n'est pas un FITS "
-                    f"(premiers octets : {bytes(debut[:80])!r})."
-                )
-            chemin_temp.replace(chemin)
-            return chemin
+            afficher_fits(url, numero)
+            return url
         except (requests.RequestException, OSError, ValueError) as exc:
             erreurs.append(f"{url}: {exc}")
-            if chemin_temp is not None:
-                chemin_temp.unlink(missing_ok=True)
 
     detail = "\n".join(erreurs[:5])
     raise LookupError(
-        "Des résultats ont été trouvés, mais aucun téléchargement n'a produit un FITS valide.\n"
+        "Des résultats ont été trouvés, mais aucun téléchargement n'a produit une image FITS exploitable.\n"
         + detail
     )
 
@@ -196,7 +213,7 @@ def main():
         time_mjd = None if not temps else tuple(float(x) for x in temps.split())
 
         chemin = rechercher_image(ra, dec, rayon, band_wave_um=band_wave_um, time_mjd=time_mjd)
-        print(f"Image FITS téléchargée et vérifiée : {chemin.resolve()}", flush=True)
+        print(f"Image FITS affichée depuis l'URL : {chemin}", flush=True)
     except (ValueError, LookupError, RuntimeError) as exc:
         print(f"Échec : {exc}", flush=True)
 
