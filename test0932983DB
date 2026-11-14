@@ -1,0 +1,65 @@
+import os
+import requests
+from astropy.coordinates import SkyCoord
+import astropy.units as u
+from astropy.io import fits
+from astropy.visualization import ZScaleInterval
+from astroquery.ipac.irsa import Irsa
+import matplotlib.pyplot as plt
+
+# 1. Définir la cible (Étoile de Barnard) et le rayon de recherche
+cible = SkyCoord.from_name("Barnard's Star")
+rayon_recherche = 0.05 * u.deg
+
+print(f"Recherche des images SPHEREx autour de RA={cible.ra.deg:.4f}, Dec={cible.dec.deg:.4f}...")
+
+# 2. Interroger les collections officielles DR1 et QR3 sur IRSA
+resultats = Irsa.query_sia(
+    pos=(cible, rayon_recherche),
+    collection=["spherex_dr1", "spherex_qr3"]
+)
+
+print(f"Nombre d'observations trouvées : {len(resultats)}")
+
+if len(resultats) == 0:
+    print("Aucune image trouvée pour cette coordonnée.")
+    exit()
+
+# 3. Créer les dossiers locaux de destination
+dossier_fits = "spherex_fits"
+dossier_png = "spherex_png"
+os.makedirs(dossier_fits, exist_ok=True)
+os.makedirs(dossier_png, exist_ok=True)
+
+# 4. Télécharger les 5 premières images (découpes / cutouts)
+for i, row in enumerate(resultats[:5]):
+    url_base = row["access_url"]
+    url_cutout = f"{url_base}?center={cible.ra.deg},{cible.dec.deg}&size=0.05"
+    
+    date_obs = int(row["t_min"]) if "t_min" in row.colnames else i
+    bande = row["energy_bandpassname"] if "energy_bandpassname" in row.colnames else "bande"
+    
+    nom_base = f"spherex_{i:02d}_{bande}_mjd{date_obs}"
+    chemin_fits = os.path.join(dossier_fits, f"{nom_base}.fits")
+    chemin_png = os.path.join(dossier_png, f"{nom_base}.png")
+    
+    print(f"[{i+1}] Téléchargement de {nom_base}...")
+    reponse = requests.get(url_cutout)
+    
+    if reponse.status_code == 200:
+        with open(chemin_fits, "wb") as f:
+            f.write(reponse.content)
+            
+        # Conversion du fichier astronomique FITS en image PNG visible
+        with fits.open(chemin_fits) as hdul:
+            image_data = hdul["IMAGE"].data if "IMAGE" in hdul else hdul[1].data
+            
+            zscale = ZScaleInterval()
+            vmin, vmax = zscale.get_limits(image_data)
+            plt.imsave(chemin_png, image_data, cmap="viridis", vmin=vmin, vmax=vmax, origin="lower")
+            
+        print(f"    -> Image enregistrée : {chemin_png}")
+    else:
+        print(f"    -> Erreur HTTP {reponse.status_code}")
+
+print("\nTerminé ! Ouvrez le dossier 'spherex_png' pour voir vos images.")
