@@ -1,285 +1,116 @@
+from __future__ import annotations
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
 import streamlit as st
-import math
 
-# Configuration de la page.
-st.set_page_config(
-    page_title="SPHEREx Explorer",
-    page_icon="🌌",
-    layout="wide"
-)
+from spherex_service import COLLECTIONS, download_observation, read_fits_image, search_observations
 
-# Initialisation des variables de session.
-if "mission_launched" not in st.session_state:
-    st.session_state.mission_launched = False
-
-if "matching_images" not in st.session_state:
-    st.session_state.matching_images = []
-
-if "active_index" not in st.session_state:
-    st.session_state.active_index = 0
-
-
-# Personnalisation graphique.
+st.set_page_config(page_title="SPHEREx Explorer", page_icon="🌌", layout="wide")
 st.markdown("""
 <style>
-
-.stApp {
-    background: linear-gradient(140deg, #050D20, #0B1930);
-    color: white;
-}
-
-.block-container {
-    max-width: 1150px;
-    padding-top: 2rem;
-}
-
-h1, h2, h3, p, label {
-    color: white !important;
-}
-
-.hero {
-    background: linear-gradient(110deg, #102C50, #10203B);
-    border: 1px solid #28517B;
-    border-radius: 18px;
-    padding: 30px;
-    margin-bottom: 25px;
-}
-
-.hero-title {
-    font-size: 38px;
-    font-weight: 800;
-    color: white;
-}
-
-.hero-subtitle {
-    color: #A9C8E8;
-    font-size: 16px;
-    margin-top: 8px;
-}
-
-.mission-card {
-    background: #10223D;
-    border: 1px solid #29466A;
-    border-radius: 16px;
-    padding: 22px;
-    margin-bottom: 20px;
-}
-
-.status {
-    color: #64D5FF;
-    font-weight: bold;
-    font-size: 12px;
-    letter-spacing: 2px;
-}
-
-.stForm {
-    background: #10223D;
-    border: 1px solid #29466A;
-    border-radius: 15px;
-    padding: 22px;
-}
-
-.stNumberInput input {
-    background-color: #193657;
-    color: white;
-    border: 1px solid #365B80;
-    border-radius: 8px;
-}
-
-[data-testid="stFormSubmitButton"] button {
-    background: linear-gradient(90deg, #087FCB, #20B8ED);
-    color: white;
-    border: none;
-    border-radius: 10px;
-    font-weight: bold;
-    min-height: 48px;
-    width: 100%;
-}
-
-.stButton button {
-    background: #163454;
-    color: white;
-    border: 1px solid #3476A8;
-    border-radius: 10px;
-    min-height: 42px;
-}
-
-.stButton button:hover {
-    background: #1769A3;
-    color: white;
-    border-color: #55C8FF;
-}
-
-[data-testid="stImage"] {
-    border: 1px solid #315577;
-    border-radius: 14px;
-    overflow: hidden;
-}
-
-hr {
-    border-color: #29466A;
-}
-
+.stApp { background: linear-gradient(140deg, #050D20, #0B1930); color: white; }
+.block-container { max-width: 1150px; padding-top: 2rem; }
+h1, h2, h3, p, label { color: white !important; }
+.hero { background: linear-gradient(110deg, #102C50, #10203B); border: 1px solid #28517B;
+        border-radius: 18px; padding: 28px; margin-bottom: 20px; }
+.status { color: #64D5FF; font-weight: bold; font-size: 12px; letter-spacing: 2px; }
 </style>
 """, unsafe_allow_html=True)
 
-
-# En-tête du jeu.
 st.markdown("""
 <div class="hero">
-    <div class="status">SPACE EXPLORATION SYSTEM</div>
-    <div class="hero-title">🌌 SPHEREx Explorer</div>
-    <div class="hero-subtitle">
-        Your mission: explore the universe through time.
-    </div>
+  <div class="status">NASA/IPAC INFRARED SCIENCE ARCHIVE · SIA2</div>
+  <h1>🌌 SPHEREx Explorer</h1>
+  <p>Search real SPHEREx observations by sky position and browse the available epochs.</p>
 </div>
 """, unsafe_allow_html=True)
 
-
-# Informations sur la mission.
-col1, col2 = st.columns(2)
-
-with col1:
-    st.markdown(
-        '<div class="mission-card">'
-        '<div class="status">MISSION STATUS</div>'
-        '<h3>Ready for exploration</h3>'
-        '<p>Choose your destination in the universe.</p>'
-        '</div>',
-        unsafe_allow_html=True
-    )
-
-with col2:
-    st.markdown(
-        '<div class="mission-card">'
-        '<div class="status">DATA SOURCE</div>'
-        '<h3>SPHEREx Archive</h3>'
-        '<p>Currently using a local test image.</p>'
-        '</div>',
-        unsafe_allow_html=True
-    )
-
-
-# Formulaire de sélection de destination.
-st.markdown("### 🎯 Choose your destination")
+st.info(
+    "This app queries IRSA's SIA2 service. QR3 and DR1 are searchable; QR2 is no longer "
+    "searchable via SIA2. Observations are shown in time order when epoch metadata is available."
+)
 
 with st.form("search_form"):
-
-    col1, col2 = st.columns(2)
-
-    with col1:
-        ra = st.number_input(
-            "Right Ascension (RA) in degrees",
-            min_value=0.0,
-            max_value=360.0,
-            value=0.0
-        )
-
-    with col2:
-        dec = st.number_input(
-            "Declination (Dec) in degrees",
-            min_value=-90.0,
-            max_value=90.0,
-            value=0.0
-        )
-
-    search = st.form_submit_button(
-        "🚀 LAUNCH EXPLORATION",
-        use_container_width=True
+    left, right = st.columns(2)
+    with left:
+        ra = st.number_input("Right Ascension (degrees)", 0.0, 360.0, 10.0, format="%.6f")
+        radius = st.number_input("Search radius (degrees)", 0.001, 5.0, 0.1, format="%.3f")
+    with right:
+        dec = st.number_input("Declination (degrees)", -90.0, 90.0, 20.0, format="%.6f")
+        limit = st.number_input("Maximum observations", 1, 200, 50)
+    selected_labels = st.multiselect(
+        "SPHEREx data collections", list(COLLECTIONS),
+        default=["QR3 — Wide survey", "DR1 — Wide survey"],
     )
+    submitted = st.form_submit_button("🔭 Search IRSA", use_container_width=True)
 
-
-# Images de démonstration et coordonnées fictives.
-images = [
-    {
-        "file": "images/Test.jpg",
-        "ra": 10.0,
-        "dec": 20.0
-    }
-]
-
-
-# Recherche des images correspondantes.
-if search:
-
-    st.session_state.mission_launched = True
-    st.session_state.active_index = 0
-
-    st.session_state.matching_images = [
-        image for image in images
-        if math.isclose(ra, image["ra"], abs_tol=0.000001)
-        and math.isclose(dec, image["dec"], abs_tol=0.000001)
-    ]
-
-
-# Affichage des résultats de la mission.
-if st.session_state.mission_launched:
-
-    results = st.session_state.matching_images
-
-    st.markdown("---")
-    st.markdown("### 🪐 Exploration results")
-
-    if results:
-
-        st.success(f"{len(results)} observation(s) found.")
-
-        # Navigation entre les observations.
-        if len(results) > 1:
-
-            col1, col2, col3 = st.columns([1, 2, 1])
-
-            with col1:
-                if st.button("◀ PREVIOUS", use_container_width=True):
-                    st.session_state.active_index = (
-                        st.session_state.active_index - 1
-                    ) % len(results)
-
-            with col3:
-                if st.button("NEXT ▶", use_container_width=True):
-                    st.session_state.active_index = (
-                        st.session_state.active_index + 1
-                    ) % len(results)
-
-            # Sélection d'une observation dans la timeline.
-            selected_index = st.slider(
-                "Observation timeline",
-                min_value=0,
-                max_value=len(results) - 1,
-                value=st.session_state.active_index,
-                format="Observation %d"
+if submitted:
+    try:
+        collections = [COLLECTIONS[label] for label in selected_labels]
+        with st.spinner("Searching the IRSA SPHEREx archive…"):
+            st.session_state.observations = search_observations(
+                ra, dec, radius, collections, int(limit)
             )
+        st.session_state.search_position = (ra, dec, radius)
+    except Exception as exc:
+        st.session_state.observations = []
+        st.error(f"IRSA search failed: {exc}")
 
-            st.session_state.active_index = selected_index
+observations = st.session_state.get("observations", [])
+if observations:
+    st.success(f"Found {len(observations)} observation(s).")
+    summary_rows = []
+    for index, observation in enumerate(observations):
+        summary_rows.append({
+            "#": index + 1,
+            "Epoch": observation.get("epoch", "—"),
+            "Collection": observation.get("collection", "—"),
+            "Band": observation.get("band", observation.get("filter", "—")),
+            "Observation ID": observation.get("obs_id", observation.get("dp_id", "—")),
+        })
+    st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True)
 
+    labels = [
+        f"{i + 1}. {item.get('epoch', 'epoch unknown')} · {item.get('collection', '')}"
+        for i, item in enumerate(observations)
+    ]
+    selected_index = st.selectbox(
+        "Observation timeline", range(len(observations)),
+        format_func=lambda index: labels[index],
+    )
+    current = observations[selected_index]
+    try:
+        with st.spinner("Downloading and reading the selected FITS observation…"):
+            fits_path = download_observation(current)
+            image, wcs = read_fits_image(fits_path)
+        finite = image[np.isfinite(image)]
+        if finite.size == 0:
+            st.warning("This FITS image contains no finite pixels to display.")
         else:
-            st.caption("Observation 1 / 1")
+            low, high = np.nanpercentile(finite, [1, 99])
+            if not np.isfinite(low) or not np.isfinite(high) or low == high:
+                low, high = float(np.nanmin(finite)), float(np.nanmax(finite))
+            if low == high:
+                high = low + 1
+            fig, ax = plt.subplots(figsize=(10, 8))
+            ax.imshow(image, origin="lower", cmap="magma", vmin=low, vmax=high)
+            ax.set_title(f"{current.get('collection', 'SPHEREx')} · {current.get('epoch', 'epoch unknown')}")
+            ax.set_xlabel("Image pixel X (WCS available in FITS)")
+            ax.set_ylabel("Image pixel Y")
+            st.pyplot(fig, use_container_width=True)
+            plt.close(fig)
+            st.caption(
+                f"FITS: {fits_path.name} · Image shape: {image.shape[1]} × {image.shape[0]} · "
+                f"Celestial WCS detected: {wcs.has_celestial}"
+            )
+            st.caption("Image values are displayed with a 1st–99th percentile stretch.")
+    except Exception as exc:
+        st.error(f"Could not display this observation: {exc}")
+        st.caption("The archive result remains listed; its FITS extension may not be a 2-D celestial image.")
+elif st.session_state.get("search_position") and not observations:
+    st.warning("No observations were returned for this position and collection selection.")
 
-        # Affichage de l'image sélectionnée.
-        current_image = results[st.session_state.active_index]
-
-        st.markdown("#### 🔭 Current observation")
-
-        st.image(
-            current_image["file"],
-            caption="Test image — demonstration only",
-            use_container_width=True
-        )
-
-        st.caption(
-            f"RA: {current_image['ra']}° | "
-            f"Dec: {current_image['dec']}°"
-        )
-
-    else:
-        st.warning(
-            "No observation found for these coordinates. "
-            "Try RA = 10 and Dec = 20 to test the application."
-        )
-
-
-# Pied de page.
 st.markdown("---")
-st.caption(
-    "SPHEREx Explorer | NASA Space Apps Challenge | Demo version"
-)
+st.caption("SPHEREx Explorer · Data provided by NASA/IPAC IRSA · Candidates require scientific validation.")
