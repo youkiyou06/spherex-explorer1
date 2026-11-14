@@ -1,11 +1,43 @@
-!pip install astroquery
 from astroquery.ipac.irsa import Irsa
 from astropy.coordinates import SkyCoord
 import astropy.units as u
 
-endroit = SkyCoord(ra=10, dec=41, unit='deg')
-photo1 = Irsa.query_sia(pos=(endroit, 1*u.deg), collection='spherex_dr1')
-photo2 = Irsa.query_sia(pos=(endroit, 1*u.deg), collection='spherex_qr3')
+def get_spherex_urls(ra_deg, dec_deg, radius_deg=1.0, collections=("spherex_dr1", "spherex_qr3")):
+    """
+    Query SPHEREx SIA catalogs around a sky position and return access URLs.
+    """
+    position = SkyCoord(ra=ra_deg * u.deg, dec=dec_deg * u.deg)
 
-print(photo1[0]['access_url'])
-print(photo2[0]['access_url'])
+    all_results = {}
+
+    for collection in collections:
+        try:
+            table = Irsa.query_sia(
+                pos=(position, radius_deg * u.deg),
+                collection=collection
+            )
+
+            if len(table) == 0:
+                print(f"No results found for {collection}.")
+                all_results[collection] = []
+                continue
+
+            urls = [row["access_url"] for row in table]
+            all_results[collection] = urls
+
+            print(f"\n{collection}:")
+            for url in urls[:5]:
+                print(url)
+
+            if len(urls) > 5:
+                print(f"... and {len(urls) - 5} more URL(s)")
+
+        except Exception as e:
+            print(f"Failed to query {collection}: {e}")
+            all_results[collection] = []
+
+    return all_results
+
+
+if __name__ == "__main__":
+    results = get_spherex_urls(ra_deg=10, dec_deg=41, radius_deg=1.0)
