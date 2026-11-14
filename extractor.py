@@ -58,6 +58,12 @@ def search_images(ra, dec, search_radius=0.01):
             print(f"Erreur pour {collection}: {exc}")
             continue
 
+        # Diagnostic temporaire : vérifier la réponse reçue de l'archive.
+        print(f"\n--- Réponse SIA pour {collection} ---")
+        print("URL :", response.url)
+        print("HTTP :", response.status_code)
+        print("Début de la réponse :", response.text[:1500])
+
         try:
             root = ET.fromstring(response.content)
         except ET.ParseError as exc:
@@ -73,6 +79,7 @@ def search_images(ra, dec, search_radius=0.01):
         )
 
         if table is None:
+            print(f"Aucune TABLE VOTable trouvée pour {collection}.")
             continue
 
         fields = [
@@ -80,6 +87,12 @@ def search_images(ra, dec, search_radius=0.01):
             for field in table
             if field.tag.endswith("FIELD")
         ]
+
+        print("Champs trouvés :", fields)
+        print("Formats de données :", [
+            child.tag for child in table.iter()
+            if child.tag.endswith(("TABLEDATA", "BINARY", "BINARY2", "INFO"))
+        ])
 
         for tr in table.iter():
             if not tr.tag.endswith("TR"):
@@ -208,3 +221,4 @@ def extract_image(
     print("Fichier :", output.resolve())
 
     return output
+
