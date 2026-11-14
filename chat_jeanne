@@ -1,0 +1,520 @@
+from pathlib import Path
+code = r'''from __future__ import annotations
+
+import io
+import math
+import re
+from typing import Any
+
+import numpy as np
+import requests
+import streamlit as st
+import streamlit.components.v1 as components
+from astropy.io import fits
+from astropy.wcs import WCS
+from PIL import Image
+
+# ============================================================
+# SPHEREx EXPLORER — Défi Planet X
+# Application Streamlit : Aladin + recherche IRSA + différence FITS
+# ============================================================
+
+st.set_page_config(
+    page_title="Défi Planet X | SPHEREx Explorer",
+    page_icon="🌌",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+IRSA_SIA_URL = "https://irsa.ipac.caltech.edu/SIA"
+REQUEST_TIMEOUT = 45
+DEFAULT_RA = 10.684
+DEFAULT_DEC = 41.269
+
+# ----------------------------- STYLE -----------------------------
+st.markdown(
+    """
+    <style>
+    .stApp {
+        background:
+          radial-gradient(circle at 15% 5%, rgba(0,145,220,.16), transparent 30%),
+          linear-gradient(140deg,#040b18 0%,#09172b 55%,#07101f 100%);
+        color:#edf6ff;
+    }
+    .block-container {max-width:1450px;padding-top:1.5rem;padding-bottom:3rem;}
+    h1,h2,h3,p,label {color:#edf6ff;}
+    .hero {
+        padding:28px 32px;border-radius:22px;margin-bottom:20px;
+        background:linear-gradient(115deg,rgba(13,48,82,.98),rgba(9,25,48,.96));
+        border:1px solid rgba(45,171,235,.45);
+        box-shadow:0 15px 50px rgba(0,0,0,.22);
+    }
+    .hero h1 {font-size:2.25rem;margin:0 0 8px 0;}
+    .hero p {color:#a9c9e7;margin:0;font-size:1rem;}
+    div[data-testid="stMetric"] {
+        background:rgba(14,39,66,.72);border:1px solid #214d72;
+        border-radius:14px;padding:12px;
+    }
+    .stButton>button,.stDownloadButton>button {
+        border-radius:10px;border:1px solid #258ac2;
+        background:linear-gradient(90deg,#075b98,#087db8);
+        color:white;font-weight:700;min-height:43px;
+    }
+    .stButton>button:hover,.stDownloadButton>button:hover {
+        border-color:#64d8ff;color:white;
+    }
+    .panel {
+        background:rgba(12,32,55,.78);border:1px solid #21486b;
+        padding:16px 18px;border-radius:15px;
+    }
+    .muted {color:#9db8d1;font-size:.9rem;}
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+st.markdown(
+    """
+    <div class="hero">
+      <h1>🌌 DÉFI PLANET X — SPHEREx Explorer</h1>
+      <p>Explore le ciel avec Aladin, recherche des observations infrarouges
+      SPHEREx et compare deux époques pour repérer les variations.</p>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
+
+# ----------------------------- SESSION -----------------------------
+defaults = {
+    "mode": "Exploration libre",
+    "selected_ra": DEFAULT_RA,
+    "selected_dec": DEFAULT_DEC,
+    "observations": [],
+    "selected_obs": [],
+    "last_query": None,
+    "image_cache": {},
+}
+for key, value in defaults.items():
+    if key not in st.session_state:
+        st.session_state[key] = value
+
+
+# ----------------------------- HELPERS -----------------------------
+def angular_separation(ra1: float, dec1: float, ra2: float, dec2: float) -> float:
+    """Distance angulaire en degrés, avec gestion correcte du passage RA 0/360."""
+    r1, d1, r2, d2 = map(math.radians, (ra1, dec1, ra2, dec2))
+    dra = (r2 - r1 + math.pi) % (2 * math.pi) - math.pi
+    a = math.sin((d2 - d1) / 2) ** 2 + math.cos(d1) * math.cos(d2) * math.sin(dra / 2) ** 2
+    return math.degrees(2 * math.asin(math.sqrt(max(0.0, min(1.0, a)))))
+
+
+def safe_float(value: Any, default: float | None = None) -> float | None:
+    try:
+        result = float(value)
+        return result if math.isfinite(result) else default
+    except (TypeError, ValueError):
+        return default
+
+
+def query_spherex(ra: float, dec: float, radius: float, limit: int = 100) -> list[dict]:
+    """
+    Interroge le service SIA d'IRSA autour d'une position céleste.
+    La réponse VOTable est lue par Astropy. Les noms de colonnes varient
+    parfois selon le produit/catalogue : on teste plusieurs alias.
+    """
+    params = {
+        "POS": f"CIRCLE {ra:.8f} {dec:.8f} {radius:.8f}",
+        "SIZE": f"{radius * 2:.8f}",
+        "FORMAT": "image/fits",
+    }
+    response = requests.get(IRSA_SIA_URL, params=params, timeout=REQUEST_TIMEOUT)
+    response.raise_for_status()
+
+    from astropy.io.votable import parse_single_table
+    table = parse_single_table(io.BytesIO(response.content)).to_table(use_names_over_ids=True)
+
+    rows: list[dict] = []
+    for row in table[:limit]:
+        item = {str(name).lower(): row[name] for name in table.colnames}
+
+        def first(*names):
+            for name in names:
+                if name.lower() in item:
+                    value = item[name.lower()]
+                    if np.ma.is_masked(value):
+                        continue
+                    if isinstance(value, bytes):
+                        value = value.decode("utf-8", "ignore")
+                    text_value = str(value).strip()
+                    if text_value and text_value.lower() not in {"--", "none", "masked"}:
+                        return text_value
+            return None
+
+        url = first("access_url", "access_reference", "url", "accessurl")
+        if not url:
+            continue
+        rows.append({
+            "url": url,
+            "title": first("obs_title", "target_name", "obs_id", "dataproduct_subtype") or "Observation SPHEREx",
+            "date": first(" t_min", "t_min", "date_obs", "obs_date", "mjd_obs") or "Date non fournie",
+            "band": first("energy_band", "em_band", "filter", "band", "spectral_band") or "Non précisée",
+            "ra": safe_float(first("s_ra", "ra", "s_ra_c")),
+            "dec": safe_float(first("s_dec", "dec", "s_dec_c")),
+            "format": first(" access_format", "access_format") or "image/fits",
+        })
+    return rows
+
+
+def download_fits(url: str) -> fits.HDUList:
+    """Télécharge un FITS depuis l'URL fournie par les métadonnées IRSA."""
+    if not url.startswith(("https://", "http://")):
+        raise ValueError("URL d'observation invalide.")
+    response = requests.get(url, timeout=REQUEST_TIMEOUT)
+    response.raise_for_status()
+    return fits.open(io.BytesIO(response.content), memmap=False)
+
+
+def find_image_hdu(hdul: fits.HDUList):
+    for hdu in hdul:
+        data = getattr(hdu, "data", None)
+        if data is not None and np.asarray(data).ndim >= 2:
+            arr = np.asarray(data)
+            if arr.ndim == 2:
+                return hdu
+            if arr.ndim == 3:
+                # Choix du premier plan si le FITS contient un cube.
+                return hdu
+    raise ValueError("Aucune image 2D exploitable trouvée dans ce FITS.")
+
+
+def fits_to_2d(hdul: fits.HDUList) -> tuple[np.ndarray, WCS | None, fits.Header]:
+    hdu = find_image_hdu(hdul)
+    data = np.asarray(hdu.data, dtype=np.float32)
+    while data.ndim > 2:
+        data = data[0]
+    data = np.squeeze(data)
+    if data.ndim != 2:
+        raise ValueError("Le tableau FITS n'est pas une image 2D.")
+    data = np.where(np.isfinite(data), data, np.nan)
+    wcs = None
+    try:
+        candidate = WCS(hdu.header)
+        if candidate.has_celestial:
+            wcs = candidate.celestial
+    except Exception:
+        pass
+    return data, wcs, hdu.header
+
+
+def stretch_image(data: np.ndarray) -> np.ndarray:
+    """Étirement percentile robuste pour afficher une image astronomique."""
+    finite = data[np.isfinite(data)]
+    if finite.size == 0:
+        return np.zeros(data.shape, dtype=np.uint8)
+    lo, hi = np.nanpercentile(finite, [1, 99])
+    if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+        lo, hi = np.nanmin(finite), np.nanmax(finite) + 1e-6
+    scaled = np.clip((data - lo) / (hi - lo), 0, 1)
+    scaled = np.nan_to_num(scaled, nan=0.0)
+    # Asinh donne un rendu plus lisible des sources faibles et fortes.
+    scaled = np.arcsinh(10 * scaled) / np.arcsinh(10)
+    return (scaled * 255).astype(np.uint8)
+
+
+def align_second_to_first(
+    image1: np.ndarray, wcs1: WCS | None,
+    image2: np.ndarray, wcs2: WCS | None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Aligne l'image 2 sur la grille pixel de l'image 1 si les deux WCS
+    célestes sont disponibles. Sinon, refuse une soustraction trompeuse.
+    """
+    if wcs1 is None or wcs2 is None:
+        raise ValueError(
+            "Les métadonnées WCS célestes manquent dans au moins un FITS. "
+            "Impossible de garantir un alignement astronomique fiable."
+        )
+    try:
+        from reproject import reproject_interp
+    except ImportError as exc:
+        raise ImportError("Le paquet 'reproject' manque. Installe-le avec pip install reproject.") from exc
+    aligned, footprint = reproject_interp(
+        (image2, wcs2), wcs1, shape_out=image1.shape, order="bilinear"
+    )
+    valid = (footprint > 0) & np.isfinite(image1) & np.isfinite(aligned)
+    return aligned.astype(np.float32), valid
+
+
+def make_difference(image1: np.ndarray, image2_aligned: np.ndarray, valid: np.ndarray):
+    """Soustraction scientifique simple : image 2 alignée moins image 1."""
+    difference = np.full(image1.shape, np.nan, dtype=np.float32)
+    difference[valid] = image2_aligned[valid] - image1[valid]
+    return difference
+
+
+def get_obs_label(obs: dict, index: int) -> str:
+    return f"{index + 1}. {obs.get('date', 'Date inconnue')} | {obs.get('band', 'Bande ?')} | {obs.get('title', 'SPHEREx')}"
+
+
+# ----------------------------- ALADIN MAP -----------------------------
+st.markdown("## 🛰️ Exploration du ciel")
+st.caption("Déplace-toi dans la carte, zoome, puis clique sur une zone pour transmettre ses coordonnées à la recherche SPHEREx.")
+
+aladin_html = r"""
+<!DOCTYPE html><html><head><meta charset="utf-8">
+<link rel="stylesheet" href="https://aladin.cds.unistra.fr/AladinLite/api/v3/latest/aladin.min.css"/>
+<style>
+html,body{margin:0;padding:0;background:#030914;font-family:Arial,sans-serif;color:#eaf7ff}
+#wrap{height:650px;position:relative;border:1px solid #168bd0;border-radius:15px;overflow:hidden;background:#030914}
+#aladin{width:100%;height:100%}
+#hud{position:absolute;top:13px;left:13px;z-index:20;background:rgba(2,13,29,.88);border:1px solid #168bd0;border-radius:10px;padding:10px 13px;font-size:12px;line-height:1.7;pointer-events:none}
+#hud b{color:#42d8ff}
+#hint{position:absolute;bottom:12px;left:13px;z-index:20;background:rgba(2,13,29,.85);border-radius:8px;padding:8px 10px;color:#a8dfff;font-size:12px;pointer-events:none}
+#busy{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;background:#030914;z-index:50}
+#busy span{padding:14px 18px;border:1px solid #168bd0;border-radius:10px;background:#0a2038}
+</style></head><body>
+<div id="wrap"><div id="aladin"></div>
+<div id="busy"><span>Chargement d'Aladin Lite…</span></div>
+<div id="hud"><b>COORDONNÉES DU CENTRE</b><div id="ra">RA : --</div><div id="dec">DEC : --</div><div id="fov">Champ : --</div><div id="status">Initialisation</div></div>
+<div id="hint">Glisser pour naviguer · Molette pour zoomer · Cliquer sur la carte pour choisir une cible</div>
+</div>
+<script src="https://aladin.cds.unistra.fr/AladinLite/api/v3/latest/aladin.js"></script>
+<script>
+(function(){
+ const busy=document.getElementById('busy');
+ function fail(msg){busy.style.display='flex';busy.innerHTML='<span>'+msg+'</span>';}
+ function sendSelection(ra,dec){
+   const payload={type:'spherex_target',ra:Number(ra),dec:Number(dec),time:Date.now()};
+   // Streamlit Components reçoit les messages postés dans sa fenêtre par le composant.
+   window.parent.postMessage({isStreamlitMessage:true,type:'streamlit:setComponentValue',value:payload},'*');
+   document.getElementById('status').textContent='Cible sélectionnée';
+ }
+ function init(){
+   if(typeof A==='undefined'){fail("Aladin Lite indisponible. Vérifie la connexion Internet.");return;}
+   A.init.then(()=>{
+     const aladin=A.aladin('#aladin',{
+       target:'10.684 41.269',fov:2,cooFrame:'ICRS',survey:'P/DSS2/color',
+       showReticle:false,showCooGrid:true,showZoomControl:true,
+       showFullscreenControl:true,showContextMenu:true
+     });
+     busy.style.display='none';
+     function update(){
+       const p=aladin.getRaDec(), f=aladin.getFov();
+       document.getElementById('ra').textContent='RA : '+p[0].toFixed(6)+'°';
+       document.getElementById('dec').textContent='DEC : '+p[1].toFixed(6)+'°';
+       document.getElementById('fov').textContent='Champ : '+f[0].toFixed(4)+'°';
+       document.getElementById('status').textContent='Exploration active';
+     }
+     aladin.on('positionChanged',update);aladin.on('zoomChanged',update);
+     // L'événement de clic renvoie la position céleste sous le pointeur.
+     aladin.on('objectClicked',function(object){});
+     aladin.on('click',function(position){
+       if(position && position.ra!==undefined && position.dec!==undefined)
+         sendSelection(position.ra,position.dec);
+       else if(position && position.length>=2)
+         sendSelection(position[0],position[1]);
+     });
+     update();
+     window.addEventListener('keydown',e=>{
+       if(!['ArrowUp','ArrowDown','ArrowLeft','ArrowRight'].includes(e.key))return;
+       if(e.target && ['INPUT','TEXTAREA'].includes(e.target.tagName))return;
+       e.preventDefault();
+       const p=aladin.getRaDec(), f=aladin.getFov();
+       const step=Math.max(f[0]*.2,.005), cos=Math.max(.08,Math.cos(p[1]*Math.PI/180));
+       let ra=p[0],dec=p[1];
+       if(e.key==='ArrowUp')dec+=step;
+       if(e.key==='ArrowDown')dec-=step;
+       if(e.key==='ArrowLeft')ra-=step/cos;
+       if(e.key==='ArrowRight')ra+=step/cos;
+       aladin.gotoRaDec((ra+360)%360,Math.max(-89.9,Math.min(89.9,dec)));
+     });
+   }).catch(err=>fail('Erreur initialisation Aladin : '+err));
+ }
+ if(document.readyState==='complete')init();else window.addEventListener('load',init);
+})();
+</script></body></html>
+"""
+
+# Component value bridge. The JS posts a structured selection to Streamlit.
+target_event = components.html(aladin_html, height=660, scrolling=False)
+
+# Aladin's embedded iframe message bridge differs between Streamlit versions.
+# Keep a manual coordinate fallback so the app remains usable if the event
+# bridge is blocked by browser/iframe policy.
+with st.expander("🎯 Coordonnées de la cible (saisie ou correction manuelle)", expanded=False):
+    c1, c2, c3 = st.columns([1, 1, 1])
+    with c1:
+        ra_input = st.number_input("Ascension droite RA (°)", 0.0, 360.0, float(st.session_state.selected_ra), format="%.6f", key="ra_manual")
+    with c2:
+        dec_input = st.number_input("Déclinaison DEC (°)", -90.0, 90.0, float(st.session_state.selected_dec), format="%.6f", key="dec_manual")
+    with c3:
+        radius = st.number_input("Rayon de recherche (°)", 0.01, 5.0, 0.15, step=0.05, format="%.3f", key="search_radius")
+    if st.button("📍 Utiliser ces coordonnées", use_container_width=True):
+        st.session_state.selected_ra = ra_input % 360
+        st.session_state.selected_dec = dec_input
+        st.success(f"Cible définie : RA {ra_input:.6f}° · DEC {dec_input:.6f}°")
+
+st.markdown(
+    f"<div class='panel'><b>Dernière cible manuelle :</b> "
+    f"RA {st.session_state.selected_ra:.6f}° · "
+    f"DEC {st.session_state.selected_dec:.6f}°</div>",
+    unsafe_allow_html=True,
+)
+
+# ----------------------------- SEARCH -----------------------------
+st.markdown("## 🔭 Recherche dans les archives SPHEREx")
+st.write("La recherche utilise les métadonnées publiques du service d'archives IRSA. Les résultats affichés dépendent de la couverture réelle des archives.")
+
+sc1, sc2 = st.columns([1, 2])
+with sc1:
+    max_results = st.selectbox("Nombre maximal de résultats", [25, 50, 100, 200], index=2)
+with sc2:
+    st.caption("La requête porte sur un cône centré sur les coordonnées indiquées. Le rayon peut être ajusté ci-dessus.")
+
+if st.button("🚀 Rechercher les observations SPHEREx", type="primary", use_container_width=True):
+    try:
+        with st.spinner("Interrogation des archives IRSA…"):
+            results = query_spherex(
+                float(st.session_state.selected_ra),
+                float(st.session_state.selected_dec),
+                float(st.session_state.get("search_radius", 0.15)),
+                int(max_results),
+            )
+        st.session_state.observations = results
+        st.session_state.selected_obs = []
+        st.session_state.last_query = {
+            "ra": st.session_state.selected_ra,
+            "dec": st.session_state.selected_dec,
+            "radius": st.session_state.get("search_radius", 0.15),
+        }
+    except Exception as exc:
+        st.error(f"La recherche d'archives a échoué : {exc}")
+        st.info("Vérifie la connexion et les dépendances. Le service d'archives peut aussi être temporairement indisponible.")
+
+observations = st.session_state.observations
+if observations:
+    st.success(f"{len(observations)} observation(s) retournée(s) par le service.")
+    st.caption(f"Cible : RA {st.session_state.last_query['ra']:.6f}° · DEC {st.session_state.last_query['dec']:.6f}° · rayon {st.session_state.last_query['radius']:.3f}°")
+    labels = [get_obs_label(obs, i) for i, obs in enumerate(observations)]
+    selected_labels = st.multiselect(
+        "Sélectionne une ou deux observations à afficher / comparer",
+        labels,
+        default=labels[: min(2, len(labels))],
+        max_selections=2,
+    )
+    selected_indices = [labels.index(label) for label in selected_labels]
+    st.session_state.selected_obs = [observations[i] for i in selected_indices]
+
+    with st.expander("Voir les métadonnées retournées"):
+        st.dataframe(
+            [{
+                "Date": o["date"], "Bande": o["band"], "Description": o["title"],
+                "RA": o["ra"], "DEC": o["dec"], "URL du fichier": o["url"]
+            } for o in observations],
+            use_container_width=True,
+            hide_index=True,
+        )
+else:
+    st.info("Aucun résultat chargé. Lance une recherche pour interroger les archives SPHEREx.")
+
+# ----------------------------- DISPLAY / DIFFERENCE -----------------------------
+chosen = st.session_state.selected_obs
+if chosen:
+    st.markdown("## 🖼️ Observations sélectionnées")
+    if len(chosen) == 1:
+        st.warning("Sélectionne une deuxième observation pour calculer une différence entre deux époques.")
+    if st.button("⬇️ Télécharger et afficher les FITS sélectionnés", use_container_width=True):
+        try:
+            loaded = []
+            progress = st.progress(0)
+            for idx, obs in enumerate(chosen):
+                with st.spinner(f"Téléchargement de l'observation {idx + 1}/{len(chosen)}…"):
+                    hdul = download_fits(obs["url"])
+                    data, wcs, header = fits_to_2d(hdul)
+                    loaded.append((obs, data, wcs, header))
+                    hdul.close()
+                progress.progress((idx + 1) / len(chosen))
+            st.session_state["loaded_fits"] = loaded
+        except Exception as exc:
+            st.error(f"Impossible de lire le fichier FITS : {exc}")
+
+loaded = st.session_state.get("loaded_fits", [])
+if loaded:
+    st.markdown("### Images astronomiques")
+    image_cols = st.columns(len(loaded))
+    for col, (obs, data, wcs, header) in zip(image_cols, loaded):
+        with col:
+            st.markdown(f"**{obs['date']}**")
+            st.caption(f"Bande : {obs['band']} · {data.shape[1]} × {data.shape[0]} pixels")
+            st.image(stretch_image(data), use_container_width=True, caption="Image FITS — étirement d'affichage")
+            with st.expander("En-tête FITS"):
+                st.code(repr(header)[:5000])
+
+    if len(loaded) == 2:
+        st.markdown("## ✨ Comparaison temporelle — Image 2 − Image 1")
+        obs1, image1, wcs1, header1 = loaded[0]
+        obs2, image2, wcs2, header2 = loaded[1]
+        st.caption("La seconde image est reprojetée sur la grille céleste de la première avant la soustraction. Les zones sans couverture commune sont masquées.")
+        try:
+            aligned2, valid = align_second_to_first(image1, wcs1, image2, wcs2)
+            difference = make_difference(image1, aligned2, valid)
+            diff_valid = difference[np.isfinite(difference)]
+            if diff_valid.size == 0:
+                raise ValueError("Aucun pixel commun valide après alignement.")
+            # Affichage centré sur zéro avec échelle symétrique robuste.
+            limit = float(np.nanpercentile(np.abs(diff_valid), 99))
+            limit = max(limit, 1e-8)
+            display = np.clip((difference / (2 * limit)) + 0.5, 0, 1)
+            display = np.nan_to_num(display, nan=0.5)
+            diff_rgb = np.zeros((*display.shape, 3), dtype=np.uint8)
+            positive = np.clip(difference / limit, 0, 1)
+            negative = np.clip(-difference / limit, 0, 1)
+            diff_rgb[..., 0] = (positive * 255).astype(np.uint8)
+            diff_rgb[..., 1] = ((1 - np.maximum(positive, negative)) * 35).astype(np.uint8)
+            diff_rgb[..., 2] = (negative * 255).astype(np.uint8)
+            st.image(
+                diff_rgb,
+                caption="Différence : rouge = signal plus élevé dans l'image 2 ; bleu = signal plus faible dans l'image 2",
+                use_container_width=True,
+            )
+            st.caption("Important : une différence non nulle ne prouve pas à elle seule qu'un objet se déplace. Il faut contrôler l'alignement, les artefacts, la couverture, le bruit et les variations instrumentales.")
+            with st.expander("Afficher les deux images alignées et la différence numérique"):
+                a, b, c = st.columns(3)
+                a.image(stretch_image(image1), caption="Image 1")
+                b.image(stretch_image(aligned2), caption="Image 2 alignée")
+                c.image(stretch_image(difference), caption="Différence en niveaux de gris")
+            buffer = io.BytesIO()
+            np.savez_compressed(buffer, image1=image1, image2_aligned=aligned2, difference=difference, valid=valid)
+            st.download_button(
+                "Télécharger les données de comparaison (.npz)",
+                data=buffer.getvalue(),
+                file_name="spherex_image_difference.npz",
+                mime="application/octet-stream",
+            )
+        except Exception as exc:
+            st.error(f"Comparaison impossible : {exc}")
+            st.info("Pour une soustraction fiable, les deux fichiers doivent contenir une image scientifique et un WCS céleste valide. Vérifie aussi que `reproject` est installé.")
+
+# ----------------------------- COORDINATE SEARCH -----------------------------
+with st.expander("🧭 Recherche directe par coordonnées", expanded=False):
+    with st.form("coordinate_search"):
+        ca, cb, cc = st.columns(3)
+        with ca:
+            direct_ra = st.number_input("RA (°)", 0.0, 360.0, DEFAULT_RA, format="%.6f")
+        with cb:
+            direct_dec = st.number_input("DEC (°)", -90.0, 90.0, DEFAULT_DEC, format="%.6f")
+        with cc:
+            direct_radius = st.number_input("Rayon (°)", 0.01, 5.0, 0.15, format="%.3f")
+        submitted = st.form_submit_button("Rechercher cette position", use_container_width=True)
+    if submitted:
+        st.session_state.selected_ra = direct_ra % 360
+        st.session_state.selected_dec = direct_dec
+        st.session_state.search_radius = direct_radius
+        st.rerun()
+
+st.markdown("---")
+st.caption("Défi Planet X · SPHEREx Explorer — Aladin Lite / NASA-IPAC IRSA. Les données et produits affichés sont fournis par les archives interrogées ; la disponibilité dépend de leur couverture et de leur publication.")
+'''
+path = Path("/mnt/data/defi_planet_x_spherex_app.py")
+path.write_text(code, encoding="utf-8")
+print(path, len(code.splitlines()))
