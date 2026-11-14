@@ -1,158 +1,289 @@
+"""SPHEREx image discovery, download, and comparison helpers.
 
+Designed to be imported by the project's Streamlit interface; no prompts or
+network requests run at import time. Comparisons are exploratory products, not
+scientific transient detections. Compare products with matching bands, units,
+and processing levels whenever possible.
+"""
+
+from __future__ import annotations
+
+import os
+import tempfile
 from pathlib import Path
+from typing import Any, Mapping
+from urllib.parse import urlparse
 
 import numpy as np
 import requests
-from astroquery.ipac.irsa import Irsa
 from astropy.coordinates import SkyCoord
 from astropy.io import fits
+from astropy.table import Table
 import astropy.units as u
+from astropy.wcs import WCS
+from astroquery.ipac.irsa import Irsa
 from reproject import reproject_interp
 
 
-# Dossier "data" créé à côté de ce fichier.
-DOSSIER_DATA = Path(__file__).resolve().parent / "data"
+DATA_DIR = Path(__file__).resolve().parent / "data"
+DEFAULT_COLLECTIONS = ("spherex_dr1", "spherex_qr3")
+DISPLAY_COLUMNS = {
+    "access_url", "obs_id", "s_ra", "s_dec", "band", "filter", "time",
+    "t_min", "t_max", "mjd", "instrument", "product_type", "dataproduct_type",
+}
 
 
-def rechercher(collection, position, rayon):
-    table = Irsa.query_sia(
-        pos=(position, rayon),
-        collection=collection,
-    )
+def _python_value(value: Any) -> Any:
+    """Convert Astropy/NumPy table values to values usable by a UI or JSON."""
+    if np.ma.is_masked(value):
+        return None
+    if isinstance(value, np.generic):
+        value = value.item()
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace").strip()
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        if isinstance(value, float) and not np.isfinite(value):
+            return None
+        return value
+    return str(value)
 
-    print(f"\n{collection} : {len(table)} résultat(s)")
-    print("Colonnes disponibles :", table.colnames)
 
-    colonnes = [
-        nom for nom in table.colnames
-        if nom.lower() in {
-            "access_url", "obs_id", "s_ra", "s_dec",
-            "band", "filter", "time", "t_min", "t_max", "mjd",
-        }
-    ]
+def search_observations(
+    ra_deg: float,
+    dec_deg: float,
+    radius_deg: float = 1.0,
+    collection: str = "spherex_dr1",
+    band: str | None = None,
+    limit: int = 100,
+) -> list[dict[str, Any]]:
+    """Search an IRSA SPHEREx collection and return UI-friendly records.
 
-    for i, ligne in enumerate(table):
-        if "access_url" not in table.colnames:
+    Parameters are in degrees. ``band`` filters common ``band``/``filter``
+    columns when those fields are supplied by IRSA. Every returned record keeps
+    the original metadata and includes a stable ``index`` for selection.
+    """
+    if not -90 <= float(dec_deg) <= 90:
+        raise ValueError("dec_deg must be between -90 and 90 degrees.")
+    if not 0 < float(radius_deg) <= 180:
+        raise ValueError("radius_deg must be greater than 0 and at most 180 degrees.")
+    if int(limit) < 1:
+        raise ValueError("limit must be at least 1.")
+    if not collection or not collection.strip():
+        raise ValueError("collection must not be empty.")
+
+    position = SkyCoord(ra=float(ra_deg) * u.deg, dec=float(dec_deg) * u.deg)
+    results = Irsa.query_sia(pos=(position, float(radius_deg) * u.deg), collection=collection)
+    url_column = next((name for name in results.colnames if name.lower() == "access_url"), None)
+    if url_column is None:
+        raise RuntimeError(
+            f"IRSA returned no access_url column for {collection!r}; "
+            f"available columns: {', '.join(results.colnames)}"
+        )
+
+    records: list[dict[str, Any]] = []
+    band_names = [name for name in results.colnames if name.lower() in {"band", "filter"}]
+    for row in results:
+        record = {name: _python_value(row[name]) for name in results.colnames}
+        record["collection"] = collection
+        url = record.get(url_column)
+        if not isinstance(url, str) or not url.strip():
+            continue
+        record["access_url"] = url.strip()
+        if band and band_names:
+            available_bands = [str(record.get(name, "")).casefold() for name in band_names]
+            if not any(band.casefold() in value for value in available_bands):
+                continue
+        record["index"] = len(records)
+        records.append(record)
+        if len(records) >= int(limit):
             break
-
-        infos = {nom: str(ligne[nom]) for nom in colonnes}
-        print(f"\nIndex {i} : {infos}")
-
-    return table
+    return records
 
 
-def telecharger(table, index, chemin):
-    url = str(table[index]["access_url"]).strip()
-
-    if not url or url.lower() == "nan":
-        raise ValueError(f"Pas d'URL valide pour l'index {index}.")
-
-    print(f"\nTéléchargement de {url}")
-    reponse = requests.get(url, timeout=180)
-    reponse.raise_for_status()
-
-    chemin.parent.mkdir(parents=True, exist_ok=True)
-    chemin.write_bytes(reponse.content)
-
-    # Vérifie que le fichier téléchargé est lisible comme FITS.
-    with fits.open(chemin) as hdus:
-        hdus.verify("exception")
-
-    print(f"Fichier enregistré : {chemin}")
+def search_spherex_observations(
+    ra_deg: float,
+    dec_deg: float,
+    radius_deg: float = 1.0,
+    collections: tuple[str, ...] = DEFAULT_COLLECTIONS,
+    band: str | None = None,
+    limit_per_collection: int = 100,
+) -> dict[str, list[dict[str, Any]]]:
+    """Search multiple SPHEREx data releases for the same sky region."""
+    return {
+        collection: search_observations(
+            ra_deg, dec_deg, radius_deg, collection, band, limit_per_collection
+        )
+        for collection in collections
+    }
 
 
-def lire_image_fits(chemin):
-    with fits.open(chemin) as hdus:
+def download_observation(
+    observation: Mapping[str, Any] | str,
+    destination: str | Path,
+    timeout: tuple[float, float] = (15.0, 180.0),
+) -> Path:
+    """Download a selected IRSA product safely and verify that it is a FITS file.
+
+    ``observation`` may be a search-result record or its ``access_url``. The
+    destination is replaced only after a complete response passes FITS checks.
+    """
+    url = observation if isinstance(observation, str) else observation.get("access_url")
+    if not isinstance(url, str) or urlparse(url).scheme.lower() not in {"http", "https"}:
+        raise ValueError("The selected observation does not have a valid HTTP(S) access_url.")
+
+    path = Path(destination).expanduser().resolve()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path: Path | None = None
+    try:
+        with requests.get(url, stream=True, timeout=timeout, headers={"User-Agent": "SPHEREx-Explorer/1.0"}) as response:
+            response.raise_for_status()
+            with tempfile.NamedTemporaryFile(dir=path.parent, suffix=".download", delete=False) as temp:
+                temporary_path = Path(temp.name)
+                for chunk in response.iter_content(chunk_size=1024 * 1024):
+                    if chunk:
+                        temp.write(chunk)
+        with fits.open(temporary_path, memmap=False) as hdus:
+            hdus.verify("exception")
+            if not any(hdu.data is not None for hdu in hdus):
+                raise ValueError("The downloaded FITS file contains no data.")
+        os.replace(temporary_path, path)
+        temporary_path = None
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+    return path
+
+
+def read_fits_image(path: str | Path) -> tuple[np.ndarray, WCS]:
+    """Read the first usable 2D celestial image and its celestial WCS."""
+    path = Path(path)
+    with fits.open(path, memmap=False) as hdus:
         for hdu in hdus:
-            if hdu.data is not None and np.ndim(hdu.data) == 2:
-                image = np.array(hdu.data, dtype=float)
-                wcs = hdu.header.copy()
-                return image, wcs
+            data = hdu.data
+            if data is None or np.ndim(data) != 2 or not np.issubdtype(data.dtype, np.number):
+                continue
+            wcs = WCS(hdu.header).celestial
+            if not wcs.has_celestial:
+                continue
+            image = np.array(data, dtype=np.float64, copy=True)
+            image[~np.isfinite(image)] = np.nan
+            return image, wcs
+    raise ValueError(f"No usable 2D celestial image found in {path}.")
 
-    raise ValueError(f"Aucune image 2D trouvée dans {chemin}.")
 
+def compare_images(
+    reference_path: str | Path,
+    comparison_path: str | Path,
+    *,
+    threshold_sigma: float = 5.0,
+    coverage_threshold: float = 0.5,
+    output_dir: str | Path | None = None,
+) -> dict[str, Any]:
+    """Reproject and compare FITS images, returning arrays and candidate pixels.
 
-def comparer_images(fichier1, fichier2):
-    image1, entete1 = lire_image_fits(fichier1)
-    image2, entete2 = lire_image_fits(fichier2)
+    The comparison image is mapped onto the reference image's WCS. A robust
+    median offset is removed only for significance estimation; ``difference``
+    remains the direct comparison-minus-reference image. If ``output_dir`` is
+    supplied, FITS and CSV artifacts are written there.
+    """
+    if not np.isfinite(threshold_sigma) or threshold_sigma <= 0:
+        raise ValueError("threshold_sigma must be a positive finite number.")
+    if not 0 <= coverage_threshold <= 1:
+        raise ValueError("coverage_threshold must be between 0 and 1.")
 
-    # Aligne la deuxième image sur la grille céleste de la première.
-    image2_alignee, couverture = reproject_interp(
-        (image2, entete2),
-        entete1,
-        shape_out=image1.shape,
+    reference, reference_wcs = read_fits_image(reference_path)
+    comparison, comparison_wcs = read_fits_image(comparison_path)
+    aligned, footprint = reproject_interp(
+        (comparison, comparison_wcs),
+        reference_wcs,
+        shape_out=reference.shape,
+        return_footprint=True,
+    )
+    valid = (
+        np.isfinite(reference)
+        & np.isfinite(aligned)
+        & np.isfinite(footprint)
+        & (footprint > coverage_threshold)
+    )
+    if not np.any(valid):
+        raise ValueError("The two images have no overlapping valid sky coverage.")
+
+    difference = np.full(reference.shape, np.nan, dtype=np.float64)
+    difference[valid] = aligned[valid] - reference[valid]
+    median_offset = float(np.median(difference[valid]))
+    residual = np.full(reference.shape, np.nan, dtype=np.float64)
+    residual[valid] = difference[valid] - median_offset
+    sigma = float(1.4826 * np.median(np.abs(residual[valid])))
+
+    significance = np.zeros(reference.shape, dtype=np.float64)
+    if np.isfinite(sigma) and sigma > 0:
+        significance[valid] = residual[valid] / sigma
+    candidate_y, candidate_x = np.where(valid & (np.abs(significance) >= threshold_sigma))
+    candidates = Table(
+        {
+            "x": candidate_x.astype(np.int64),
+            "y": candidate_y.astype(np.int64),
+            "difference": difference[candidate_y, candidate_x],
+            "significance_sigma": significance[candidate_y, candidate_x],
+        }
     )
 
-    valide = (
-        np.isfinite(image1)
-        & np.isfinite(image2_alignee)
-        & (couverture > 0.5)
+    artifacts: dict[str, str] = {}
+    if output_dir is not None:
+        destination = Path(output_dir).expanduser().resolve()
+        destination.mkdir(parents=True, exist_ok=True)
+        difference_path = destination / "difference.fits"
+        fits.PrimaryHDU(data=difference, header=reference_wcs.to_header()).writeto(
+            difference_path, overwrite=True
+        )
+        candidates_path = destination / "pixels_candidats.csv"
+        candidates.write(candidates_path, format="ascii.csv", overwrite=True)
+        artifacts = {"difference_fits": str(difference_path), "candidates_csv": str(candidates_path)}
+
+    return {
+        "reference": reference,
+        "aligned_comparison": aligned,
+        "coverage": footprint,
+        "valid_mask": valid,
+        "difference": difference,
+        "residual": residual,
+        "significance": significance,
+        "candidates": candidates,
+        "median_offset": median_offset,
+        "robust_sigma": sigma,
+        "valid_pixel_count": int(np.count_nonzero(valid)),
+        "candidate_count": len(candidates),
+        "threshold_sigma": float(threshold_sigma),
+        "artifacts": artifacts,
+        "warning": (
+            "Exploratory pixel-level comparison only. Verify matching band, units, "
+            "calibration, masks, and epochs; candidates are not confirmed sources."
+        ),
+    }
+
+
+# French aliases retained for compatibility with the first script version.
+def rechercher(collection: str, position: SkyCoord, rayon: u.Quantity) -> Table:
+    """Legacy raw-table search; new interface code should use search_observations."""
+    return Irsa.query_sia(pos=(position, rayon), collection=collection)
+
+
+def telecharger(table: Table | Mapping[str, Any] | str, index: int | str, chemin: str | Path) -> Path:
+    """Legacy-compatible download wrapper."""
+    observation = table[int(index)] if isinstance(table, Table) else table
+    return download_observation(observation, chemin)
+
+
+def lire_image_fits(chemin: str | Path) -> tuple[np.ndarray, WCS]:
+    return read_fits_image(chemin)
+
+
+def comparer_images(fichier1: str | Path, fichier2: str | Path) -> dict[str, Any]:
+    result = compare_images(fichier1, fichier2, output_dir=DATA_DIR)
+    print(
+        f"{result['candidate_count']} pixels candidats au seuil "
+        f"de {result['threshold_sigma']:g} sigma."
     )
-
-    if not np.any(valide):
-        raise ValueError("Aucune zone commune valide entre les deux images.")
-
-    difference = np.full(image1.shape, np.nan)
-    difference[valide] = image2_alignee[valide] - image1[valide]
-
-    valeurs = difference[valide]
-    mediane = np.median(valeurs)
-    sigma = 1.4826 * np.median(np.abs(valeurs - mediane))
-
-    if not np.isfinite(sigma) or sigma == 0:
-        raise ValueError("Impossible d'estimer le bruit de l'image différence.")
-
-    y, x = np.where(
-        valide & (np.abs(difference - mediane) > 5 * sigma)
-    )
-
-    fichier_difference = DOSSIER_DATA / "difference.fits"
-    fits.PrimaryHDU(
-        data=difference,
-        header=fits.Header(entete1),
-    ).writeto(fichier_difference, overwrite=True)
-
-    fichier_candidats = DOSSIER_DATA / "pixels_candidats.csv"
-    np.savetxt(
-        fichier_candidats,
-        np.column_stack((x, y, difference[y, x])),
-        delimiter=",",
-        header="x,y,difference",
-        comments="",
-    )
-
-    print(f"\n{len(x)} pixels dépassent le seuil de 5 sigma.")
-    print(f"Image différence : {fichier_difference}")
-    print(f"Pixels candidats : {fichier_candidats}")
-    print("Ces pixels sont des candidats à examiner, pas une détection confirmée.")
-
-
-def main():
-    position = SkyCoord(ra=10 * u.deg, dec=41 * u.deg)
-    rayon = 1.0 * u.deg
-
-    dr1 = rechercher("spherex_dr1", position, rayon)
-    qr3 = rechercher("spherex_qr3", position, rayon)
-
-    if len(dr1) == 0 or len(qr3) == 0:
-        raise RuntimeError("Aucun résultat trouvé dans l'une des collections.")
-
-    index_dr1 = int(input("\nIndex du produit DR1 à télécharger : "))
-    index_qr3 = int(input("Index du produit QR3 à télécharger : "))
-
-    if not 0 <= index_dr1 < len(dr1):
-        raise IndexError("Index DR1 invalide.")
-    if not 0 <= index_qr3 < len(qr3):
-        raise IndexError("Index QR3 invalide.")
-
-    fichier1 = DOSSIER_DATA / "photo1.fits"
-    fichier2 = DOSSIER_DATA / "photo2.fits"
-
-    telecharger(dr1, index_dr1, fichier1)
-    telecharger(qr3, index_qr3, fichier2)
-    comparer_images(fichier1, fichier2)
-
-
-if __name__ == "__main__":
-    main()
-Bloc collé, 1 au total
+    print(result["artifacts"])
+    print(result["warning"])
+    return result
