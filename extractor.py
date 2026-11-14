@@ -23,6 +23,17 @@ def date_to_mjd(date):
 def search_images(ra, dec, search_radius=0.01):
     """Recherche les images SPHEREx autour des coordonnées."""
 
+    ra = float(ra)
+    dec = float(dec)
+    search_radius = float(search_radius)
+
+    if not 0 <= ra < 360:
+        raise ValueError("RA doit être comprise entre 0 et 360.")
+    if not -90 <= dec <= 90:
+        raise ValueError("DEC doit être comprise entre -90 et 90.")
+    if search_radius <= 0:
+        raise ValueError("Le rayon doit être strictement positif.")
+
     collections = [
         "spherex_dr1",
         "spherex_qr3"
@@ -31,23 +42,28 @@ def search_images(ra, dec, search_radius=0.01):
     observations = []
 
     for collection in collections:
-
         params = {
             "COLLECTION": collection,
             "POS": f"CIRCLE {ra} {dec} {search_radius}"
         }
 
-        response = requests.get(
-            SIA_URL,
-            params=params,
-            timeout=60
-        )
+        try:
+            response = requests.get(
+                SIA_URL,
+                params=params,
+                timeout=(15, 180)
+            )
+            response.raise_for_status()
+        except requests.RequestException as exc:
+            print(f"Erreur pour {collection}: {exc}")
+            continue
 
-        response.raise_for_status()
+        try:
+            root = ET.fromstring(response.content)
+        except ET.ParseError as exc:
+            print(f"Réponse XML invalide pour {collection}: {exc}")
+            continue
 
-        root = ET.fromstring(response.content)
-
-        # Recherche de la table VOTable
         table = next(
             (
                 element for element in root.iter()
@@ -59,16 +75,13 @@ def search_images(ra, dec, search_radius=0.01):
         if table is None:
             continue
 
-        # Récupération des noms de colonnes
         fields = [
             field.get("name", field.get("ID", "")).lower()
             for field in table
             if field.tag.endswith("FIELD")
         ]
 
-        # Lecture des observations
         for tr in table.iter():
-
             if not tr.tag.endswith("TR"):
                 continue
 
@@ -97,7 +110,6 @@ def extract_image(
 ):
     """Recherche et télécharge une image SPHEREx."""
 
-    # Vérification des coordonnées
     if not 0 <= ra < 360:
         raise ValueError("RA doit être comprise entre 0 et 360.")
 
@@ -107,21 +119,18 @@ def extract_image(
     if size <= 0 or search_radius <= 0:
         raise ValueError("Les tailles doivent être positives.")
 
-    # Vérification du détecteur
     if detector is not None:
         detector = detector.upper()
 
         if detector not in {f"D{i}" for i in range(1, 7)}:
             raise ValueError("Détecteur invalide : D1 à D6.")
 
-    # Recherche des observations
     observations = search_images(
         ra,
         dec,
         search_radius
     )
 
-    # Filtrage par détecteur
     if detector:
         observations = [
             obs for obs in observations
@@ -133,9 +142,7 @@ def extract_image(
     if not observations:
         raise ValueError("Aucune observation correspondante.")
 
-    # Sélection selon la date
     if date:
-
         requested_mjd = date_to_mjd(date)
 
         observations = [
@@ -154,7 +161,6 @@ def extract_image(
         )
 
     else:
-
         selected = max(
             observations,
             key=lambda obs: float(
@@ -162,11 +168,9 @@ def extract_image(
             )
         )
 
-    # Construction de l'URL de découpe
     original_url = selected["access_url"]
 
     parts = urlsplit(original_url)
-
     query = dict(parse_qsl(parts.query))
 
     query.update({
@@ -182,7 +186,6 @@ def extract_image(
         parts.fragment
     ))
 
-    # Téléchargement
     response = requests.get(
         cutout_url,
         timeout=180
@@ -190,15 +193,12 @@ def extract_image(
 
     response.raise_for_status()
 
-    # Vérification élémentaire du fichier FITS
     if not response.content.startswith(b"SIMPLE  ="):
         raise ValueError(
             "Le serveur n'a pas retourné un fichier FITS valide."
         )
 
-    # Enregistrement
     output = Path(output)
-
     output.write_bytes(response.content)
 
     print("Extraction réussie.")
