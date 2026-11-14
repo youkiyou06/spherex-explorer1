@@ -1,0 +1,251 @@
+from __future__ import annotations
+
+from datetime import datetime, timezone
+from io import BytesIO
+from pathlib import Path
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+
+import matplotlib.pyplot as plt
+import numpy as np
+import requests
+from astropy.io import fits
+from astropy.table import Table
+from astropy.visualization import ZScaleInterval
+
+
+SIA_URL = "https://irsa.ipac.caltech.edu/SIA"
+
+
+def date_to_mjd(date: str) -> float:
+    """Convertit une date YYYY-MM-DD en MJD."""
+    dt = datetime.strptime(date, "%Y-%m-%d").replace(
+        tzinfo=timezone.utc
+    )
+    epoch = datetime(1858, 11, 17, tzinfo=timezone.utc)
+    return (dt - epoch).total_seconds() / 86400
+
+
+def _text(value) -> str:
+    """Convertit une valeur de table Astropy en texte utilisable."""
+    if value is None or np.ma.is_masked(value):
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace").strip()
+    return str(value).strip()
+
+
+def _get(row: dict, *names: str) -> str:
+    """Cherche une colonne sans tenir compte de la casse."""
+    lowered = {str(key).lower(): value for key, value in row.items()}
+    for name in names:
+        value = _text(lowered.get(name.lower()))
+        if value:
+            return value
+    return ""
+
+
+def search_images(ra: float, dec: float, search_radius: float = 0.5) -> list[dict]:
+    """Recherche les observations SPHEREx autour d'une position."""
+    params = {
+        "COLLECTION": "SPHEREx",
+        "POS": f"{ra},{dec}",
+        "SIZE": str(search_radius),
+    }
+
+    response = requests.get(SIA_URL, params=params, timeout=60)
+    response.raise_for_status()
+
+    try:
+        table = Table.read(BytesIO(response.content), format="votable")
+    except Exception as error:
+        raise RuntimeError(
+            "Impossible de lire la réponse VOTable du service IRSA. "
+            f"Réponse reçue depuis : {response.url}"
+        ) from error
+
+    observations = []
+    for table_row in table:
+        row = {str(name).lower(): table_row[name] for name in table.colnames}
+        access_url = _get(row, "access_url", "accessurl")
+        if access_url:
+            row["access_url"] = access_url
+            observations.append(row)
+
+    return observations
+
+
+def _observation_mjd(observation: dict) -> float | None:
+    value = _get(observation, "t_min", "mjd_obs", "mjd")
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _make_cutout_url(access_url: str, ra: float, dec: float, size: float) -> str:
+    """Ajoute les paramètres de découpe à l'URL de l'observation."""
+    parts = urlsplit(access_url)
+    query = dict(parse_qsl(parts.query, keep_blank_values=True))
+    query.update({
+        "center": f"{ra},{dec}",
+        "size": str(size),
+    })
+    return urlunsplit((
+        parts.scheme,
+        parts.netloc,
+        parts.path,
+        urlencode(query),
+        parts.fragment,
+    ))
+
+
+def _display_fits(path: Path) -> None:
+    """Affiche la première image 2D exploitable du fichier FITS."""
+    with fits.open(path, memmap=False) as hdus:
+        for hdu in hdus:
+            if hdu.data is None:
+                continue
+
+            data = np.asarray(hdu.data)
+            data = np.squeeze(data)
+
+            # Pour les données multidimensionnelles, prend une première coupe.
+            while data.ndim > 2:
+                data = data[0]
+
+            if data.ndim != 2:
+                continue
+
+            finite = np.isfinite(data)
+            if not finite.any():
+                continue
+
+            image = np.where(finite, data, np.nan)
+
+            try:
+                vmin, vmax = ZScaleInterval().get_limits(image[finite])
+            except Exception:
+                vmin, vmax = np.nanpercentile(image, [1, 99])
+
+            if not np.isfinite(vmin) or not np.isfinite(vmax) or vmin == vmax:
+                vmin, vmax = np.nanpercentile(image, [1, 99])
+
+            plt.figure(figsize=(8, 7))
+            plt.imshow(
+                image,
+                origin="lower",
+                cmap="gray",
+                vmin=vmin,
+                vmax=vmax,
+            )
+            plt.colorbar(label="Valeur du pixel")
+            plt.title(f"Image SPHEREx — {path.name}")
+            plt.xlabel("Pixel X")
+            plt.ylabel("Pixel Y")
+            plt.tight_layout()
+            plt.show()
+            return
+
+    raise ValueError(
+        "Le fichier FITS a été téléchargé, mais aucune image 2D "
+        "exploitable n'a été trouvée dans ses extensions."
+    )
+
+
+def extract_image(
+    ra: float,
+    dec: float,
+    date: str | None = None,
+    size: float = 0.1,
+    search_radius: float = 0.5,
+    output: str = "spherex_image.fits",
+) -> Path:
+    """Recherche, télécharge et affiche une image SPHEREx."""
+
+    if not 0 <= ra < 360:
+        raise ValueError("RA doit être comprise entre 0 et 360 degrés.")
+    if not -90 <= dec <= 90:
+        raise ValueError("Dec doit être comprise entre -90 et 90 degrés.")
+    if size <= 0 or search_radius <= 0:
+        raise ValueError("La taille et le rayon de recherche doivent être positifs.")
+
+    observations = search_images(ra, dec, search_radius)
+    if not observations:
+        raise ValueError(
+            "Aucune observation trouvée. Essayez un rayon de recherche "
+            "plus grand ou d'autres coordonnées."
+        )
+
+    if date:
+        requested_mjd = date_to_mjd(date)
+        dated_observations = [
+            (obs, _observation_mjd(obs))
+            for obs in observations
+        ]
+        dated_observations = [
+            (obs, mjd) for obs, mjd in dated_observations if mjd is not None
+        ]
+        if not dated_observations:
+            raise ValueError(
+                "Des observations ont été trouvées, mais elles ne contiennent "
+                "pas de date MJD exploitable."
+            )
+        selected, selected_mjd = min(
+            dated_observations,
+            key=lambda item: abs(item[1] - requested_mjd),
+        )
+    else:
+        dated_observations = [
+            (obs, _observation_mjd(obs))
+            for obs in observations
+        ]
+        dated_observations = [
+            (obs, mjd) for obs, mjd in dated_observations if mjd is not None
+        ]
+        if dated_observations:
+            selected, selected_mjd = max(dated_observations, key=lambda item: item[1])
+        else:
+            selected, selected_mjd = observations[0], None
+
+    access_url = _get(selected, "access_url")
+    if not access_url:
+        raise ValueError("L'observation sélectionnée ne fournit pas d'URL de téléchargement.")
+
+    cutout_url = _make_cutout_url(access_url, ra, dec, size)
+    download = requests.get(cutout_url, timeout=180)
+    download.raise_for_status()
+
+    # Astropy vérifie que le contenu téléchargé est bien lisible comme FITS.
+    try:
+        with fits.open(BytesIO(download.content), memmap=False) as hdus:
+            if not hdus:
+                raise ValueError("Le fichier FITS ne contient aucune extension.")
+    except Exception as error:
+        raise ValueError(
+            "Le serveur n'a pas renvoyé un fichier FITS lisible. "
+            f"URL demandée : {cutout_url}"
+        ) from error
+
+    output_path = Path(output)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_bytes(download.content)
+
+    print("Extraction réussie.")
+    print(f"Coordonnées demandées : RA={ra:.6f}°, Dec={dec:.6f}°")
+    print(f"Observation : {_get(selected, 'obs_id', 'obsid') or 'non renseignée'}")
+    print(f"Date MJD : {selected_mjd if selected_mjd is not None else 'non renseignée'}")
+    print(f"Fichier : {output_path.resolve()}")
+
+    _display_fits(output_path)
+    return output_path
+
+
+if __name__ == "__main__":
+    # M31 / galaxie d'Andromède — coordonnées en degrés décimaux.
+    extract_image(
+        ra=10.6847,
+        dec=41.2688,
+        search_radius=0.5,
+        size=0.1,
+        output="spherex_m31.fits",
+    )
