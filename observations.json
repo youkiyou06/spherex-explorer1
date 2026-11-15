@@ -1,0 +1,11 @@
+{
+  "observations": [
+    {
+      "filename": "Test.jpg",
+      "ra_deg": 10.0,
+      "dec_deg": 20.0,
+      "date": "2025-01-15",
+      "band": "Test"
+    }
+  ]
+}
