@@ -1,0 +1,80 @@
+
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="https://unpkg.com/streamlit-component-lib@1.4.0/dist/streamlit.js"></script>
+<style>
+body{margin:0;background:#07152f;color:white;font-family:Arial;overflow:hidden}
+#toolbar{padding:12px;background:#10264b;display:flex;flex-wrap:wrap;gap:12px;align-items:center}
+button{background:#e8c547;color:#07152f;font-weight:bold;border:none;border-radius:8px;padding:11px 16px;cursor:pointer}
+#coordinates{color:#e8c547;font-size:14px}
+#stel{height:580px;width:100%;background:#000}
+iframe{width:100%;height:580px;border:0}
+#error{color:#ffaaaa;padding:8px}
+</style>
+</head>
+<body>
+<div id="toolbar">
+    <span id="coordinates">Centre : RA 83.633° Dec 22.014°</span>
+    <button id="select">Utiliser le centre de Stellarium</button>
+    <button id="orion">→ Orion / M42</button>
+    <button id="gal">→ Centre Galactique</button>
+</div>
+<iframe id="stel-frame" src="https://stellarium-web.org/"></iframe>
+<div id="error"></div>
+<script>
+(function(){
+    const Streamlit = window.Streamlit;
+    let current = {ra: 83.633, dec: 22.014};
+
+    function updateLabel(){
+        document.getElementById("coordinates").textContent = "Centre estimé : RA " + current.ra.toFixed(4) + "° | Dec " + current.dec.toFixed(4) + "° | Utilisez le champ RA/Dec en dessous pour affiner";
+    }
+
+    function sendCoords(){
+        Streamlit.setComponentValue({ra: current.ra, dec: current.dec});
+    }
+
+    function parseHash(){
+        try{
+            let hash = document.getElementById("stel-frame").contentWindow.location.hash;
+            if(hash && hash.includes("ra=")){
+                let m = hash.match(/ra=([0-9.\-]+)/);
+                let m2 = hash.match(/dec=([0-9.\-]+)/);
+                if(m) current.ra = parseFloat(m[1]);
+                if(m2) current.dec = parseFloat(m2[1]);
+                if(current.ra < 0) current.ra += 360;
+                updateLabel();
+            }
+        }catch(e){}
+    }
+
+    document.getElementById("select").onclick = function(){ sendCoords(); };
+    document.getElementById("orion").onclick = function(){
+        current = {ra: 83.633, dec: -5.391};
+        document.getElementById("stel-frame").src = "https://stellarium-web.org/#ra=83.633&dec=-5.391&fov=10";
+        updateLabel();
+    };
+    document.getElementById("gal").onclick = function(){
+        current = {ra: 266.416, dec: -29.007};
+        document.getElementById("stel-frame").src = "https://stellarium-web.org/#ra=266.416&dec=-29.007&fov=10";
+        updateLabel();
+    };
+
+    Streamlit.events.addEventListener(Streamlit.RENDER_EVENT, function(event){
+        let args = event.detail.args || {};
+        if(args.ra !== undefined) current.ra = Number(args.ra);
+        if(args.dec !== undefined) current.dec = Number(args.dec);
+        updateLabel();
+    });
+
+    Streamlit.setComponentReady();
+    Streamlit.setFrameHeight(650);
+    updateLabel();
+    setInterval(parseHash, 1500);
+})();
+</script>
+</body>
+</html>
