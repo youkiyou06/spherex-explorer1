@@ -1,0 +1,1374 @@
+from __future__ import annotations
+
+import base64
+import hashlib
+import html
+import json
+import os
+import sqlite3
+import tempfile
+from pathlib import Path
+from typing import Any, Mapping, Sequence
+from urllib.parse import urlparse
+
+import matplotlib.pyplot as plt
+import numpy as np
+import requests
+import streamlit as st
+import streamlit.components.v1 as components
+
+from astropy import units as u
+from astropy.coordinates import SkyCoord
+from astropy.io import fits
+from astropy.wcs import WCS
+from astroquery.ipac.irsa import Irsa
+from reproject import reproject_interp
+
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+APP_DIR = Path(__file__).resolve().parent
+DATA_DIR = APP_DIR / "data_spherex"
+FITS_CACHE_DIR = DATA_DIR / "fits_cache"
+DATABASE_PATH = DATA_DIR / "observations.sqlite3"
+
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+FITS_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+COLLECTIONS = {
+    "DR1 — Wide": "spherex_dr1",
+    "DR1 — Deep": "spherex_dr1_deep",
+    "QR3 — Wide": "spherex_qr3",
+    "QR3 — Deep": "spherex_qr3_deep",
+}
+
+BACKGROUND = "#07152f"
+PANEL = "#10264b"
+YELLOW = "#e8c547"
+
+st.set_page_config(
+    page_title="SPHEREx Explorer",
+    page_icon="🌌",
+    layout="wide",
+    initial_sidebar_state="collapsed",
+)
+
+
+# ============================================================
+# BASE SQLITE LOCALE
+# ============================================================
+
+def init_database() -> None:
+    """Crée la base locale de métadonnées si elle n'existe pas."""
+    with sqlite3.connect(DATABASE_PATH) as connection:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS observations (
+                observation_id TEXT PRIMARY KEY,
+                collection TEXT,
+                epoch TEXT,
+                band TEXT,
+                access_url TEXT NOT NULL,
+                metadata_json TEXT NOT NULL,
+                saved_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        connection.commit()
+
+
+def save_observations(records: Sequence[Mapping[str, Any]]) -> int:
+    """Enregistre les métadonnées IRSA en évitant les doublons."""
+    count = 0
+
+    with sqlite3.connect(DATABASE_PATH) as connection:
+        for record in records:
+            url = str(record.get("access_url") or "").strip()
+            if not url:
+                continue
+
+            identifier = str(
+                record.get("observation_id")
+                or record.get("obs_id")
+                or record.get("obsid")
+                or hashlib.sha256(url.encode("utf-8")).hexdigest()
+            )
+
+            metadata = json.dumps(
+                dict(record),
+                ensure_ascii=False,
+                default=str,
+            )
+
+            connection.execute(
+                """
+                INSERT INTO observations (
+                    observation_id,
+                    collection,
+                    epoch,
+                    band,
+                    access_url,
+                    metadata_json
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(observation_id) DO UPDATE SET
+                    collection = excluded.collection,
+                    epoch = excluded.epoch,
+                    band = excluded.band,
+                    access_url = excluded.access_url,
+                    metadata_json = excluded.metadata_json,
+                    saved_at = CURRENT_TIMESTAMP
+                """,
+                (
+                    identifier,
+                    str(record.get("collection") or ""),
+                    get_epoch(record),
+                    get_band(record),
+                    url,
+                    metadata,
+                ),
+            )
+            count += 1
+
+        connection.commit()
+
+    return count
+
+
+def database_count() -> int:
+    with sqlite3.connect(DATABASE_PATH) as connection:
+        result = connection.execute(
+            "SELECT COUNT(*) FROM observations"
+        ).fetchone()
+    return int(result[0]) if result else 0
+
+
+init_database()
+
+
+# ============================================================
+# MÉTADONNÉES ET RECHERCHE
+# ============================================================
+
+def plain_value(value: Any) -> Any:
+    """Convertit les valeurs Astropy/NumPy en types JSON simples."""
+    if value is None:
+        return None
+
+    try:
+        if np.ma.is_masked(value):
+            return None
+    except (TypeError, ValueError):
+        pass
+
+    if isinstance(value, np.generic):
+        value = value.item()
+
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace").strip()
+
+    if isinstance(value, float) and not np.isfinite(value):
+        return None
+
+    if isinstance(value, (str, int, float, bool)):
+        return value
+
+    return str(value)
+
+
+def get_field(record: Mapping[str, Any], *names: str) -> Any:
+    """Récupère une colonne de métadonnées sans tenir compte de la casse."""
+    lowered = {str(key).lower(): value for key, value in record.items()}
+
+    for name in names:
+        value = lowered.get(name.lower())
+        if value is None:
+            continue
+
+        text = str(value).strip().lower()
+        if text not in {"", "--", "nan", "none", "masked"}:
+            return value
+
+    return None
+
+
+def get_band(record: Mapping[str, Any]) -> str:
+    value = get_field(
+        record,
+        "band_value",
+        "energy_bandpassname",
+        "band",
+        "filter",
+        "filter_name",
+        "bandpass",
+        "bandnum",
+    )
+    return str(value) if value is not None else "Bande inconnue"
+
+
+def get_epoch(record: Mapping[str, Any]) -> str:
+    value = get_field(
+        record,
+        "epoch",
+        "mjd",
+        "mjd_obs",
+        "t_min",
+        "time",
+        "date_obs",
+        "obs_date",
+    )
+    return str(value) if value is not None else "Époque inconnue"
+
+
+def sort_key(record: Mapping[str, Any]) -> tuple[int, float | str, str]:
+    """Trie les observations par MJD ou, à défaut, par date."""
+    value = get_field(record, "mjd", "mjd_obs", "t_min", "epoch")
+
+    try:
+        if value is not None:
+            return (
+                0,
+                float(value),
+                str(record.get("observation_id", "")),
+            )
+    except (TypeError, ValueError):
+        pass
+
+    return (
+        1,
+        get_epoch(record),
+        str(record.get("observation_id", "")),
+    )
+
+
+def observation_label(record: Mapping[str, Any]) -> str:
+    identifier = (
+        get_field(record, "observation_id", "obs_id", "obsid", "dp_id")
+        or "Observation"
+    )
+    return f"{get_epoch(record)} · {get_band(record)} · {identifier}"
+
+
+def search_irsa(
+    ra_deg: float,
+    dec_deg: float,
+    radius_deg: float,
+    collections: Sequence[str],
+    limit: int,
+) -> list[dict[str, Any]]:
+    """Recherche les produits SPHEREx des collections IRSA choisies."""
+    ra_deg = float(ra_deg)
+    dec_deg = float(dec_deg)
+    radius_deg = float(radius_deg)
+    limit = int(limit)
+
+    if not 0 <= ra_deg < 360:
+        raise ValueError("La RA doit être comprise entre 0° inclus et 360° exclu.")
+    if not -90 <= dec_deg <= 90:
+        raise ValueError("La déclinaison doit être comprise entre -90° et +90°.")
+    if not 0 < radius_deg <= 10:
+        raise ValueError("Le rayon doit être supérieur à 0° et inférieur ou égal à 10°.")
+    if not collections:
+        raise ValueError("Sélectionne au moins une collection.")
+    if limit < 1:
+        raise ValueError("La limite de résultats doit être positive.")
+
+    position = SkyCoord(
+        ra=ra_deg * u.deg,
+        dec=dec_deg * u.deg,
+        frame="icrs",
+    )
+
+    results: list[dict[str, Any]] = []
+    seen_urls: set[str] = set()
+    errors: list[str] = []
+
+    for collection in collections:
+        try:
+            table = Irsa.query_sia(
+                pos=(position, radius_deg * u.deg),
+                collection=collection,
+            )
+        except Exception as error:
+            errors.append(f"{collection}: {error}")
+            continue
+
+        url_column = next(
+            (
+                name
+                for name in table.colnames
+                if str(name).lower() == "access_url"
+            ),
+            None,
+        )
+
+        if url_column is None:
+            errors.append(f"{collection}: colonne access_url absente")
+            continue
+
+        for row in table:
+            record = {
+                str(name): plain_value(row[name])
+                for name in table.colnames
+            }
+
+            url = record.get(url_column)
+            if not isinstance(url, str):
+                continue
+
+            url = url.strip()
+            if urlparse(url).scheme.lower() not in {"http", "https"}:
+                continue
+            if url in seen_urls:
+                continue
+
+            seen_urls.add(url)
+            record["access_url"] = url
+            record["collection"] = collection
+
+            raw_band = get_field(
+                record,
+                "energy_bandpassname",
+                "band",
+                "filter",
+                "filter_name",
+                "bandpass",
+                "bandnum",
+            )
+            record["band_value"] = str(raw_band) if raw_band is not None else None
+
+            raw_epoch = get_field(
+                record,
+                "mjd",
+                "mjd_obs",
+                "t_min",
+                "time",
+                "date_obs",
+                "obs_date",
+            )
+            record["epoch"] = plain_value(raw_epoch)
+
+            raw_identifier = get_field(
+                record,
+                "obs_id",
+                "obsid",
+                "dp_id",
+                "obs_publisher_did",
+            )
+            record["observation_id"] = str(
+                raw_identifier
+                or hashlib.sha256(url.encode("utf-8")).hexdigest()
+            )
+
+            results.append(record)
+
+            if len(results) >= limit:
+                break
+
+        if len(results) >= limit:
+            break
+
+    if not results and errors:
+        raise RuntimeError(
+            "La recherche IRSA n'a pas abouti. "
+            + " | ".join(errors[:4])
+        )
+
+    results.sort(key=sort_key)
+    return results[:limit]
+
+
+# ============================================================
+# CACHE ET LECTURE FITS
+# ============================================================
+
+def cached_download(record: Mapping[str, Any]) -> Path:
+    """Télécharge et valide un FITS une fois par URL."""
+    url = record.get("access_url")
+
+    if (
+        not isinstance(url, str)
+        or urlparse(url).scheme.lower() not in {"http", "https"}
+    ):
+        raise ValueError("L'observation ne contient pas d'URL FITS valide.")
+
+    digest = hashlib.sha256(url.encode("utf-8")).hexdigest()
+    is_gzip = urlparse(url).path.lower().endswith(".fits.gz")
+    suffix = ".fits.gz" if is_gzip else ".fits"
+    destination = FITS_CACHE_DIR / f"{digest}{suffix}"
+
+    if destination.is_file() and destination.stat().st_size > 0:
+        try:
+            with fits.open(destination, memmap=False) as hdus:
+                hdus.verify("exception")
+                if any(hdu.data is not None for hdu in hdus):
+                    return destination
+        except Exception:
+            destination.unlink(missing_ok=True)
+
+    temporary_path: Path | None = None
+
+    try:
+        with requests.get(
+            url,
+            stream=True,
+            timeout=(20, 240),
+            headers={"User-Agent": "SPHEREx-Explorer/1.0"},
+        ) as response:
+            response.raise_for_status()
+
+            with tempfile.NamedTemporaryFile(
+                dir=FITS_CACHE_DIR,
+                suffix=".download",
+                delete=False,
+            ) as handle:
+                temporary_path = Path(handle.name)
+
+                for chunk in response.iter_content(chunk_size=1024 * 1024):
+                    if chunk:
+                        handle.write(chunk)
+
+        with fits.open(temporary_path, memmap=False) as hdus:
+            hdus.verify("exception")
+            if not any(hdu.data is not None for hdu in hdus):
+                raise ValueError("Le FITS téléchargé ne contient aucune donnée.")
+
+        os.replace(temporary_path, destination)
+        temporary_path = None
+
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+
+    return destination
+
+
+def read_fits_image(path: str | Path) -> tuple[np.ndarray, WCS]:
+    """Lit la première image FITS 2D avec des coordonnées célestes."""
+    with fits.open(path, memmap=False) as hdus:
+        candidates = sorted(
+            enumerate(hdus),
+            key=lambda item: item[1].name.upper() != "IMAGE",
+        )
+
+        for _index, hdu in candidates:
+            data = hdu.data
+
+            if data is None or np.ndim(data) != 2:
+                continue
+            if not np.issubdtype(np.asarray(data).dtype, np.number):
+                continue
+
+            try:
+                wcs = WCS(hdu.header).celestial
+                if not wcs.has_celestial:
+                    continue
+            except Exception:
+                continue
+
+            image = np.array(data, dtype=np.float32, copy=True)
+            image[~np.isfinite(image)] = np.nan
+
+            if np.isfinite(image).any():
+                return image, wcs
+
+    raise ValueError("Aucune image FITS 2D exploitable avec WCS céleste n'a été trouvée.")
+
+
+def stretch_image(image: np.ndarray) -> np.ndarray:
+    """Améliore le contraste uniquement pour la visualisation."""
+    image = np.asarray(image, dtype=np.float32)
+    finite = np.isfinite(image)
+
+    if not finite.any():
+        raise ValueError("L'image ne contient aucun pixel fini.")
+
+    low, high = np.nanpercentile(image[finite], [1, 99])
+
+    if not np.isfinite(low) or not np.isfinite(high) or high <= low:
+        low = float(np.nanmin(image[finite]))
+        high = float(np.nanmax(image[finite]))
+        if high <= low:
+            high = low + 1.0
+
+    normalized = np.clip((image - low) / (high - low), 0.0, 1.0)
+    return np.nan_to_num(normalized, nan=0.0, posinf=1.0, neginf=0.0)
+
+
+def make_png(image: np.ndarray, title: str) -> bytes:
+    """Convertit une image scientifique en PNG pour l'aperçu du comparateur."""
+    normalized = stretch_image(image)
+
+    figure, axis = plt.subplots(figsize=(5, 5), dpi=100)
+    try:
+        axis.imshow(normalized, cmap="gray", origin="lower", interpolation="nearest")
+        axis.set_title(title, fontsize=9)
+        axis.set_axis_off()
+        figure.tight_layout(pad=0.5)
+
+        from io import BytesIO
+
+        output = BytesIO()
+        figure.savefig(output, format="png", bbox_inches="tight")
+        return output.getvalue()
+    finally:
+        plt.close(figure)
+
+
+# ============================================================
+# COMPARAISON D'IMAGES
+# ============================================================
+
+def compare_fits(
+    reference_record: Mapping[str, Any],
+    comparison_record: Mapping[str, Any],
+    threshold_sigma: float,
+) -> dict[str, Any]:
+    """Aligne les images sur le WCS de référence puis calcule leur différence."""
+    if reference_record.get("access_url") == comparison_record.get("access_url"):
+        raise ValueError("Choisis deux observations différentes.")
+
+    first_band = get_band(reference_record)
+    second_band = get_band(comparison_record)
+
+    if (
+        first_band != "Bande inconnue"
+        and second_band != "Bande inconnue"
+        and first_band.casefold() != second_band.casefold()
+    ):
+        raise ValueError(
+            f"Les bandes sont différentes ({first_band} / {second_band}). "
+            "Pour une comparaison directe, choisis la même bande."
+        )
+
+    first_path = cached_download(reference_record)
+    second_path = cached_download(comparison_record)
+
+    reference, reference_wcs = read_fits_image(first_path)
+    comparison, comparison_wcs = read_fits_image(second_path)
+
+    aligned, footprint = reproject_interp(
+        (comparison, comparison_wcs),
+        reference_wcs,
+        shape_out=reference.shape,
+        return_footprint=True,
+    )
+
+    valid = (
+        np.isfinite(reference)
+        & np.isfinite(aligned)
+        & np.isfinite(footprint)
+        & (footprint > 0.5)
+    )
+
+    if not valid.any():
+        raise ValueError("Les deux images n'ont pas de couverture céleste valide commune.")
+
+    difference = np.full(reference.shape, np.nan, dtype=np.float32)
+    difference[valid] = aligned[valid] - reference[valid]
+
+    median_offset = float(np.nanmedian(difference[valid]))
+    residual = difference[valid] - median_offset
+    robust_sigma = float(1.4826 * np.nanmedian(np.abs(residual)))
+
+    if np.isfinite(robust_sigma) and robust_sigma > 0:
+        significance = np.full(reference.shape, np.nan, dtype=np.float32)
+        significance[valid] = (
+            difference[valid] - median_offset
+        ) / robust_sigma
+
+        candidate_y, candidate_x = np.where(
+            valid & (np.abs(significance) >= threshold_sigma)
+        )
+
+        candidate_rows = [
+            {
+                "x": int(x),
+                "y": int(y),
+                "différence_pixel": float(difference[y, x]),
+                "significativité_sigma": float(significance[y, x]),
+            }
+            for y, x in zip(candidate_y, candidate_x)
+        ]
+
+        candidate_rows.sort(
+            key=lambda row: abs(row["significativité_sigma"]),
+            reverse=True,
+        )
+    else:
+        candidate_rows = []
+
+    return {
+        "difference": difference,
+        "valid_pixel_count": int(np.count_nonzero(valid)),
+        "median_offset": median_offset,
+        "robust_sigma": robust_sigma,
+        "candidates": candidate_rows[:200],
+        "total_candidates": len(candidate_rows),
+    }
+
+
+# ============================================================
+# COMPARATEUR CLIGNOTANT HTML
+# ============================================================
+
+def blink_comparator(records: Sequence[Mapping[str, Any]]) -> None:
+    """Télécharge une sélection réduite et affiche une animation clignotante."""
+    if len(records) < 2:
+        st.info("Il faut au moins deux observations pour créer un comparateur.")
+        return
+
+    max_frames = min(12, len(records))
+    frame_count = st.slider(
+        "Nombre d'images dans le comparateur",
+        min_value=2,
+        max_value=max_frames,
+        value=min(6, max_frames),
+        key=f"blink_count_{len(records)}",
+    )
+
+    if len(records) > frame_count:
+        indexes = np.linspace(
+            0,
+            len(records) - 1,
+            num=frame_count,
+            dtype=int,
+        )
+        selected_records = [records[index] for index in np.unique(indexes)]
+    else:
+        selected_records = list(records)
+
+    if not st.button(
+        "Créer / actualiser le comparateur clignotant",
+        use_container_width=True,
+        key=f"make_blink_{len(records)}",
+    ):
+        return
+
+    png_frames: list[tuple[str, str]] = []
+    progress = st.progress(0)
+    status = st.empty()
+
+    try:
+        for index, record in enumerate(selected_records):
+            status.write(
+                f"Chargement de l'image {index + 1}/{len(selected_records)} "
+                f"— {observation_label(record)}"
+            )
+
+            path = cached_download(record)
+            image, _wcs = read_fits_image(path)
+            png = make_png(image, observation_label(record))
+            encoded = base64.b64encode(png).decode("ascii")
+
+            png_frames.append(
+                (
+                    f"data:image/png;base64,{encoded}",
+                    observation_label(record),
+                )
+            )
+            progress.progress((index + 1) / len(selected_records))
+
+    except Exception as error:
+        st.error(f"Impossible de créer le comparateur : {error}")
+        return
+
+    finally:
+        progress.empty()
+        status.empty()
+
+    if len(png_frames) < 2:
+        st.warning("Moins de deux images valides ont pu être chargées.")
+        return
+
+    image_json = json.dumps(
+        [{"src": src, "label": label} for src, label in png_frames],
+        ensure_ascii=False,
+    )
+
+    html_document = f"""
+    <!doctype html>
+    <html lang="fr">
+    <head>
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1">
+      <style>
+        body {{
+          margin: 0;
+          padding: 14px;
+          color: white;
+          background: #07152f;
+          font-family: Arial, sans-serif;
+          text-align: center;
+        }}
+        img {{
+          max-width: 100%;
+          max-height: 520px;
+          object-fit: contain;
+          border: 1px solid #344b70;
+          border-radius: 10px;
+        }}
+        button {{
+          margin: 8px;
+          padding: 9px 16px;
+          border: 0;
+          border-radius: 8px;
+          background: #e8c547;
+          color: #07152f;
+          font-weight: bold;
+          cursor: pointer;
+        }}
+        input {{ width: min(80%, 600px); }}
+        #label {{ min-height: 22px; margin: 8px; }}
+      </style>
+    </head>
+    <body>
+      <div id="label"></div>
+      <img id="frame" alt="Image SPHEREx">
+      <div>
+        <button id="play">▶ Démarrer</button>
+        <button id="previous">← Précédente</button>
+        <button id="next">Suivante →</button>
+      </div>
+      <input id="position" type="range" min="0"
+             max="{len(png_frames) - 1}" value="0">
+      <script>
+        const frames = {image_json};
+        const image = document.getElementById("frame");
+        const label = document.getElementById("label");
+        const slider = document.getElementById("position");
+        const playButton = document.getElementById("play");
+        let index = 0;
+        let timer = null;
+
+        function showFrame(value) {{
+          index = (value + frames.length) % frames.length;
+          image.src = frames[index].src;
+          label.textContent = (index + 1) + "/" + frames.length + " — " + frames[index].label;
+          slider.value = index;
+        }}
+
+        function stop() {{
+          if (timer !== null) {{
+            clearInterval(timer);
+            timer = null;
+          }}
+          playButton.textContent = "▶ Démarrer";
+        }}
+
+        playButton.onclick = () => {{
+          if (timer !== null) {{
+            stop();
+          }} else {{
+            playButton.textContent = "⏸ Pause";
+            timer = setInterval(() => showFrame(index + 1), 700);
+          }}
+        }};
+
+        document.getElementById("previous").onclick = () => showFrame(index - 1);
+        document.getElementById("next").onclick = () => showFrame(index + 1);
+        slider.oninput = () => showFrame(Number(slider.value));
+        showFrame(0);
+      </script>
+    </body>
+    </html>
+    """
+
+    components.html(html_document, height=700, scrolling=False)
+
+
+# ============================================================
+# STYLE
+# ============================================================
+
+st.markdown(
+    f"""
+    <style>
+    .stApp {{
+        background: linear-gradient(140deg, #050d20, {BACKGROUND});
+        color: white;
+    }}
+
+    .block-container {{
+        max-width: 1250px;
+        padding-top: 1.5rem;
+    }}
+
+    h1, h2, h3, p, label {{
+        color: white !important;
+    }}
+
+    .hero {{
+        background: linear-gradient(110deg, {PANEL}, #10203b);
+        border: 1px solid #344b70;
+        border-radius: 18px;
+        padding: 26px;
+        margin-bottom: 18px;
+    }}
+
+    .hero-title {{
+        color: {YELLOW};
+        font-size: 40px;
+        font-weight: 800;
+    }}
+
+    .hero-subtitle {{
+        color: #c8d4e8;
+        font-size: 17px;
+        margin-top: 5px;
+    }}
+
+    .info-box {{
+        background: {PANEL};
+        border: 1px solid #344b70;
+        border-left: 4px solid {YELLOW};
+        border-radius: 12px;
+        padding: 18px;
+        margin: 12px 0;
+        line-height: 1.6;
+    }}
+
+    div.stButton > button {{
+        background: {YELLOW};
+        color: {BACKGROUND};
+        border: none;
+        border-radius: 10px;
+        font-weight: 700;
+        min-height: 44px;
+    }}
+
+    div.stButton > button:hover {{
+        background: #ffdf65;
+        color: {BACKGROUND};
+    }}
+
+    [data-testid="stForm"] {{
+        background: rgba(16, 38, 75, 0.6);
+        border: 1px solid #344b70;
+        border-radius: 12px;
+        padding: 18px;
+    }}
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+
+# ============================================================
+# ÉTAT DE SESSION ET EN-TÊTE
+# ============================================================
+
+if "page" not in st.session_state:
+    st.session_state.page = "home"
+
+if "observations" not in st.session_state:
+    st.session_state.observations = []
+
+if "search_signature" not in st.session_state:
+    st.session_state.search_signature = None
+
+if "comparison_result" not in st.session_state:
+    st.session_state.comparison_result = None
+
+st.markdown(
+    """
+    <div class="hero">
+      <div class="hero-title">🌌 SPHEREx Explorer</div>
+      <div class="hero-subtitle">
+        Explore le ciel infrarouge et compare les observations au fil du temps.
+      </div>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
+
+
+def back_button() -> None:
+    if st.button("← Retour à l'accueil"):
+        st.session_state.page = "home"
+        st.rerun()
+
+
+# ============================================================
+# PAGE D'ACCUEIL
+# ============================================================
+
+def show_home() -> None:
+    st.markdown(
+        """
+        <div class="info-box">
+          <b>Objectif</b><br>
+          Rechercher des observations SPHEREx autour d'une position céleste,
+          visualiser leur évolution temporelle et examiner les différences
+          entre des images d'une même bande spectrale.
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    left, right = st.columns(2)
+
+    with left:
+        st.subheader("⏳ Exploration temporelle")
+        st.write(
+            "Recherche IRSA par coordonnées, sélection d'une bande, "
+            "comparateur clignotant et comparaison de deux époques."
+        )
+        if st.button(
+            "Ouvrir l'exploration temporelle",
+            use_container_width=True,
+        ):
+            st.session_state.page = "temporal"
+            st.rerun()
+
+    with right:
+        st.subheader("🔭 Exploration libre")
+        st.write(
+            "Navigue sur la carte du ciel, puis utilise les coordonnées "
+            "choisies dans la recherche SPHEREx."
+        )
+        if st.button(
+            "Ouvrir la carte du ciel",
+            use_container_width=True,
+        ):
+            st.session_state.page = "map"
+            st.rerun()
+
+    st.caption(
+        f"{database_count()} observation(s) cataloguée(s) dans la base SQLite locale."
+    )
+    st.caption(f"Base de données : {DATABASE_PATH}")
+
+
+# ============================================================
+# PAGE D'EXPLORATION TEMPORELLE
+# ============================================================
+
+def show_temporal() -> None:
+    back_button()
+    st.title("⏳ Exploration temporelle")
+
+    st.markdown(
+        """
+        <div class="info-box">
+          Les résultats proviennent de l'archive publique NASA/IPAC IRSA.
+          Les fichiers FITS ne sont téléchargés qu'au moment de leur affichage
+          ou de leur comparaison et sont ensuite conservés dans le cache local.
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    label_names = list(COLLECTIONS)
+    default_labels = [
+        label for label in label_names if label == "DR1 — Wide"
+    ] or [label_names[0]]
+
+    with st.form("search_form"):
+        st.subheader("1. Région céleste")
+
+        ra_col, dec_col, radius_col = st.columns(3)
+
+        with ra_col:
+            ra = st.number_input(
+                "Ascension droite RA (degrés)",
+                min_value=0.0,
+                max_value=359.999999,
+                value=83.633,
+                format="%.6f",
+            )
+
+        with dec_col:
+            dec = st.number_input(
+                "Déclinaison Dec (degrés)",
+                min_value=-90.0,
+                max_value=90.0,
+                value=22.014,
+                format="%.6f",
+            )
+
+        with radius_col:
+            radius = st.number_input(
+                "Rayon (degrés)",
+                min_value=0.001,
+                max_value=10.0,
+                value=0.2,
+                step=0.05,
+            )
+
+        selected_labels = st.multiselect(
+            "Collections de données",
+            options=label_names,
+            default=default_labels,
+        )
+
+        limit = st.slider(
+            "Nombre maximal de résultats",
+            min_value=2,
+            max_value=100,
+            value=30,
+        )
+
+        submitted = st.form_submit_button(
+            "🔎 Rechercher dans IRSA",
+            use_container_width=True,
+        )
+
+    collections = tuple(
+        COLLECTIONS[label] for label in selected_labels
+    )
+
+    signature = (
+        round(float(ra), 6),
+        round(float(dec), 6),
+        round(float(radius), 6),
+        collections,
+        int(limit),
+    )
+
+    if submitted:
+        st.session_state.observations = []
+        st.session_state.comparison_result = None
+        st.session_state.search_signature = signature
+
+        if not collections:
+            st.warning("Sélectionne au moins une collection.")
+        else:
+            try:
+                with st.spinner("Recherche des observations dans IRSA…"):
+                    results = search_irsa(
+                        ra_deg=ra,
+                        dec_deg=dec,
+                        radius_deg=radius,
+                        collections=collections,
+                        limit=limit,
+                    )
+
+                st.session_state.observations = results
+
+                if results:
+                    saved = save_observations(results)
+                    st.success(
+                        f"{len(results)} observation(s) trouvée(s). "
+                        f"{saved} métadonnée(s) enregistrée(s) dans la base locale."
+                    )
+                else:
+                    st.info(
+                        "Aucune observation trouvée. Essaie une autre position, "
+                        "un rayon différent ou une autre collection."
+                    )
+
+            except Exception as error:
+                st.error(f"La recherche a échoué : {error}")
+
+    records = st.session_state.observations
+
+    if not records:
+        st.info("Lance une recherche pour afficher les observations.")
+        return
+
+    if st.session_state.search_signature != signature:
+        st.warning(
+            "Les paramètres ont changé. Relance la recherche pour obtenir "
+            "des résultats correspondant aux nouveaux paramètres."
+        )
+        return
+
+    records = sorted(records, key=sort_key)
+
+    st.subheader("2. Observations disponibles")
+    st.dataframe(
+        [
+            {
+                "Époque": get_epoch(record),
+                "Bande": get_band(record),
+                "Collection": record.get("collection", "—"),
+                "Identifiant": record.get("observation_id", "—"),
+            }
+            for record in records
+        ],
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    band_options = sorted({get_band(record) for record in records})
+    selected_band = st.selectbox(
+        "Bande spectrale",
+        options=band_options,
+        key="band_selection",
+    )
+
+    band_records = [
+        record for record in records
+        if get_band(record) == selected_band
+    ]
+    band_records.sort(key=sort_key)
+
+    st.caption(
+        f"{len(band_records)} observation(s) dans la bande « {selected_band} »."
+    )
+
+    if not band_records:
+        return
+
+    st.subheader("3. Visualiser une observation")
+
+    selected_index = st.select_slider(
+        "Époque à afficher",
+        options=list(range(len(band_records))),
+        value=0,
+        format_func=lambda index: observation_label(band_records[index]),
+    )
+
+    selected_record = band_records[selected_index]
+
+    if st.button("Charger / afficher l'image sélectionnée"):
+        try:
+            with st.spinner("Téléchargement éventuel et lecture du FITS…"):
+                fits_path = cached_download(selected_record)
+                image, _wcs = read_fits_image(fits_path)
+
+            st.session_state["current_image"] = stretch_image(image)
+            st.session_state["current_image_label"] = observation_label(
+                selected_record
+            )
+            st.session_state["current_image_url"] = selected_record["access_url"]
+
+        except Exception as error:
+            st.error(f"Impossible de charger l'image : {error}")
+
+    if (
+        st.session_state.get("current_image") is not None
+        and st.session_state.get("current_image_url")
+        == selected_record.get("access_url")
+    ):
+        st.image(
+            st.session_state["current_image"],
+            caption=st.session_state["current_image_label"],
+            use_container_width=True,
+        )
+
+    with st.expander("Métadonnées de l'observation sélectionnée"):
+        st.json(dict(selected_record))
+
+    st.subheader("4. Comparateur clignotant")
+    st.write(
+        "Le comparateur alterne entre plusieurs observations chronologiques. "
+        "Les images sont visualisées dans leur grille FITS d'origine."
+    )
+    blink_comparator(band_records)
+
+    st.subheader("5. Comparer deux époques")
+    if len(band_records) < 2:
+        st.info("Il faut au moins deux observations dans cette bande.")
+        return
+
+    col_first, col_second = st.columns(2)
+
+    with col_first:
+        first_index = st.selectbox(
+            "Image de référence",
+            options=list(range(len(band_records))),
+            index=0,
+            format_func=lambda index: observation_label(band_records[index]),
+            key="compare_reference",
+        )
+
+    with col_second:
+        second_index = st.selectbox(
+            "Image à comparer",
+            options=list(range(len(band_records))),
+            index=min(1, len(band_records) - 1),
+            format_func=lambda index: observation_label(band_records[index]),
+            key="compare_later",
+        )
+
+    threshold = st.slider(
+        "Seuil exploratoire (σ)",
+        min_value=2.0,
+        max_value=10.0,
+        value=5.0,
+        step=0.5,
+    )
+
+    if st.button(
+        "Aligner et comparer les images",
+        type="primary",
+        use_container_width=True,
+    ):
+        if first_index == second_index:
+            st.warning("Choisis deux observations différentes.")
+        else:
+            try:
+                with st.spinner(
+                    "Téléchargement éventuel, alignement WCS et comparaison…"
+                ):
+                    result = compare_fits(
+                        band_records[first_index],
+                        band_records[second_index],
+                        threshold_sigma=float(threshold),
+                    )
+                st.session_state.comparison_result = result
+                st.session_state.comparison_labels = (
+                    observation_label(band_records[first_index]),
+                    observation_label(band_records[second_index]),
+                )
+            except Exception as error:
+                st.session_state.comparison_result = None
+                st.error(f"La comparaison a échoué : {error}")
+
+    result = st.session_state.get("comparison_result")
+
+    if result is not None:
+        labels = st.session_state.get("comparison_labels", ("", ""))
+
+        st.caption(
+            f"Référence : {labels[0]} · Image comparée : {labels[1]}"
+        )
+
+        metric1, metric2, metric3 = st.columns(3)
+        metric1.metric("Pixels valides comparés", result["valid_pixel_count"])
+        metric2.metric("Dispersion robuste", f"{result['robust_sigma']:.4g}")
+        metric3.metric(
+            "Pixels candidats affichés",
+            len(result["candidates"]),
+            help="Pixels au-dessus du seuil choisi, pas des objets astronomiques confirmés.",
+        )
+
+        difference = result["difference"]
+        finite = np.isfinite(difference)
+
+        if finite.any():
+            max_display = float(
+                np.nanpercentile(np.abs(difference[finite]), 99)
+            )
+            if not np.isfinite(max_display) or max_display <= 0:
+                max_display = 1.0
+
+            figure, axis = plt.subplots(figsize=(9, 6))
+            try:
+                image_plot = axis.imshow(
+                    difference,
+                    origin="lower",
+                    cmap="RdBu_r",
+                    vmin=-max_display,
+                    vmax=max_display,
+                    interpolation="nearest",
+                )
+                axis.set_title("Image comparée − image de référence")
+                axis.set_xlabel("Pixel X")
+                axis.set_ylabel("Pixel Y")
+                figure.colorbar(
+                    image_plot,
+                    ax=axis,
+                    label="Différence des valeurs de pixels",
+                )
+                figure.tight_layout()
+                st.pyplot(figure, use_container_width=True)
+            finally:
+                plt.close(figure)
+
+        if result["candidates"]:
+            st.write(
+                f"Pixels candidats les plus significatifs "
+                f"(sur {result['total_candidates']} au total) :"
+            )
+            st.dataframe(
+                result["candidates"],
+                use_container_width=True,
+                hide_index=True,
+            )
+
+        st.warning(
+            "Ces résultats sont exploratoires. Des différences peuvent être causées "
+            "par le bruit, les masques, la calibration, le fond ou d'autres effets "
+            "instrumentaux. Un pixel candidat n'est pas une détection confirmée "
+            "d'un astéroïde, d'une étoile variable ou de Planet X."
+        )
+
+
+# ============================================================
+# CARTE DU CIEL
+# ============================================================
+
+def show_map() -> None:
+    back_button()
+    st.title("🔭 Exploration libre du ciel")
+
+    st.markdown(
+        """
+        <div class="info-box">
+          Explore la carte et relève une position céleste. Tu peux ensuite
+          entrer sa RA et sa déclinaison dans l'exploration temporelle.
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    aladin_html = """
+    <!doctype html>
+    <html lang="fr">
+    <head>
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1">
+      <script src="https://aladin.cds.unistra.fr/AladinLite/api/v3/latest/aladin.js"></script>
+      <style>
+        html, body, #aladin-lite-div {
+          width: 100%;
+          height: 100%;
+          margin: 0;
+          background: #07152f;
+        }
+      </style>
+    </head>
+    <body>
+      <div id="aladin-lite-div"></div>
+      <script>
+        A.init.then(() => {
+          A.aladin("#aladin-lite-div", {
+            target: "83.633 22.014",
+            fov: 2,
+            cooFrame: "ICRS",
+            showReticle: true,
+            showCooGrid: true,
+            showZoomControl: true,
+            showFullscreenControl: true,
+            showContextMenu: true
+          });
+        });
+      </script>
+    </body>
+    </html>
+    """
+
+    components.html(aladin_html, height=680, scrolling=False)
+    st.link_button(
+        "Ouvrir Aladin Lite dans un nouvel onglet",
+        "https://aladin.cds.unistra.fr/AladinLite/",
+    )
+    st.caption(
+        "La carte nécessite Internet et le chargement du service Aladin Lite."
+    )
+
+
+# ============================================================
+# ROUTAGE DE L'APPLICATION
+# ============================================================
+
+if st.session_state.page == "home":
+    show_home()
+elif st.session_state.page == "temporal":
+    show_temporal()
+elif st.session_state.page == "map":
+    show_map()
+else:
+    st.session_state.page = "home"
+    st.rerun()
+
+st.divider()
+st.caption(
+    "Données SPHEREx : NASA/IPAC IRSA · Carte du ciel : Aladin Lite · "
+    "Comparaisons à interpréter avec prudence."
+)

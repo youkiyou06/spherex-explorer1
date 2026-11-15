@@ -1,0 +1,378 @@
+import streamlit as st
+import json
+import math
+from pathlib import Path
+
+# =========================================================
+# CONFIGURATION
+# =========================================================
+
+st.set_page_config(
+    page_title="SPHEREx Explorer",
+    layout="wide",
+    initial_sidebar_state="collapsed"
+)
+
+BASE_DIR = Path(__file__).parent
+JSON_FILE = BASE_DIR / "observations.json"
+IMAGE_DIR = BASE_DIR / "images"
+
+# =========================================================
+# DESIGN
+# =========================================================
+
+st.markdown("""
+<style>
+    html, body, [data-testid="stAppViewContainer"] {
+        background-color: #07152f !important;
+        color: white !important;
+    }
+
+    [data-testid="stHeader"] {
+        background-color: #07152f !important;
+    }
+
+    [data-testid="stToolbar"] {
+        visibility: hidden;
+    }
+
+    .block-container {
+        padding-top: 2rem;
+        max-width: 1450px;
+    }
+
+    h1, h2, h3, p, label {
+        color: white !important;
+    }
+
+    .main-title {
+        text-align: center;
+        font-size: 42px;
+        font-weight: 800;
+        letter-spacing: 2px;
+        color: white;
+        margin-bottom: 25px;
+    }
+
+    .intro-box {
+        background: #102b55;
+        border: 1px solid #e8c547;
+        border-radius: 15px;
+        padding: 25px 35px;
+        text-align: center;
+        font-size: 19px;
+        line-height: 1.6;
+        margin: 0 auto 35px auto;
+        max-width: 1000px;
+    }
+
+    div.stButton > button {
+        background-color: #102b55;
+        color: white;
+        border: 2px solid #e8c547;
+        border-radius: 10px;
+        height: 58px;
+        font-size: 15px;
+        font-weight: 700;
+        width: 100%;
+        transition: 0.2s;
+    }
+
+    div.stButton > button:hover {
+        background-color: #e8c547;
+        color: #07152f;
+        border-color: #e8c547;
+    }
+
+    div[data-testid="stTextInput"] input,
+    div[data-testid="stNumberInput"] input {
+        background-color: #102b55;
+        color: white;
+        border: 1px solid #e8c547;
+    }
+
+    .info-box {
+        background: #102b55;
+        border-left: 4px solid #e8c547;
+        border-radius: 8px;
+        padding: 18px;
+        margin: 15px 0;
+        color: white;
+        line-height: 1.6;
+    }
+
+    .section-title {
+        color: #e8c547;
+        font-size: 23px;
+        font-weight: 700;
+        margin-top: 20px;
+        margin-bottom: 15px;
+    }
+</style>
+""", unsafe_allow_html=True)
+
+
+# =========================================================
+# OBSERVATIONS
+# =========================================================
+
+def load_observations():
+    if not JSON_FILE.exists():
+        return []
+
+    try:
+        with open(JSON_FILE, "r", encoding="utf-8") as file:
+            data = json.load(file)
+
+        return data.get("observations", [])
+
+    except Exception as error:
+        st.error(f"Unable to read observations.json: {error}")
+        return []
+
+
+def angular_distance(ra1, dec1, ra2, dec2):
+    """Calculate angular distance between two celestial positions."""
+
+    ra1 = math.radians(ra1)
+    dec1 = math.radians(dec1)
+    ra2 = math.radians(ra2)
+    dec2 = math.radians(dec2)
+
+    cos_angle = (
+        math.sin(dec1) * math.sin(dec2)
+        + math.cos(dec1)
+        * math.cos(dec2)
+        * math.cos(ra1 - ra2)
+    )
+
+    cos_angle = max(-1, min(1, cos_angle))
+
+    return math.degrees(math.acos(cos_angle))
+
+
+def search_observations(ra, dec, radius):
+    observations = load_observations()
+    results = []
+
+    for obs in observations:
+        try:
+            distance = angular_distance(
+                ra,
+                dec,
+                float(obs["ra_deg"]),
+                float(obs["dec_deg"])
+            )
+
+            if distance <= radius:
+                result = obs.copy()
+                result["distance"] = distance
+                results.append(result)
+
+        except (KeyError, ValueError, TypeError):
+            continue
+
+    return sorted(results, key=lambda item: item.get("date", ""))
+
+
+# =========================================================
+# NAVIGATION
+# =========================================================
+
+if "page" not in st.session_state:
+    st.session_state.page = "home"
+
+
+def go_home():
+    st.session_state.page = "home"
+
+
+# =========================================================
+# HOME PAGE
+# =========================================================
+
+if st.session_state.page == "home":
+
+    st.markdown(
+        '<div class="main-title">SPHEREx Explorer</div>',
+        unsafe_allow_html=True
+    )
+
+    st.markdown("""
+    <div class="intro-box">
+        Discover the sky through two exploration modes.
+        Search for observations using astronomical coordinates,
+        or navigate freely across the celestial map.
+        Choose your preferred way to explore the Universe.
+    </div>
+    """, unsafe_allow_html=True)
+
+    left, col1, col2, right = st.columns([2.5, 1.6, 1.6, 2.5])
+
+    with col1:
+        if st.button("COORDINATE SEARCH"):
+            st.session_state.page = "coordinates"
+            st.rerun()
+
+    with col2:
+        if st.button("FREE EXPLORATION"):
+            st.session_state.page = "exploration"
+            st.rerun()
+
+
+# =========================================================
+# MODE 1 : COORDINATE SEARCH
+# =========================================================
+
+elif st.session_state.page == "coordinates":
+
+    if st.button("← BACK TO HOME"):
+        go_home()
+        st.rerun()
+
+    st.markdown(
+        '<div class="main-title">Coordinate Search</div>',
+        unsafe_allow_html=True
+    )
+
+    st.markdown("""
+    <div class="intro-box">
+        Enter the celestial coordinates of a region to find
+        the observations available in our dataset.
+    </div>
+    """, unsafe_allow_html=True)
+
+    st.markdown(
+        '<div class="section-title">Search coordinates</div>',
+        unsafe_allow_html=True
+    )
+
+    col1, col2, col3 = st.columns(3)
+
+    with col1:
+        ra = st.number_input(
+            "Right Ascension (RA) in degrees",
+            min_value=0.0,
+            max_value=360.0,
+            value=10.0,
+            step=0.1
+        )
+
+    with col2:
+        dec = st.number_input(
+            "Declination (Dec) in degrees",
+            min_value=-90.0,
+            max_value=90.0,
+            value=20.0,
+            step=0.1
+        )
+
+    with col3:
+        radius = st.number_input(
+            "Search radius (degrees)",
+            min_value=0.01,
+            max_value=180.0,
+            value=2.0,
+            step=0.1
+        )
+
+    if st.button("SEARCH OBSERVATIONS"):
+        st.session_state.search_results = search_observations(
+            ra, dec, radius
+        )
+        st.session_state.search_done = True
+
+    if st.session_state.get("search_done", False):
+
+        results = st.session_state.get("search_results", [])
+
+        st.markdown(
+            '<div class="section-title">Search results</div>',
+            unsafe_allow_html=True
+        )
+
+        if not results:
+            st.warning(
+                "No observations were found in this region "
+                "in the current local dataset."
+            )
+
+        else:
+            st.success(f"{len(results)} observation(s) found.")
+
+            for i, obs in enumerate(results):
+
+                st.markdown("---")
+
+                col_image, col_info = st.columns([1, 2])
+
+                filename = obs.get("filename", "")
+                image_path = IMAGE_DIR / filename
+
+                with col_image:
+                    if filename and image_path.exists():
+                        st.image(str(image_path), use_container_width=True)
+                    else:
+                        st.warning(f"Image not found: {filename}")
+
+                with col_info:
+                    st.markdown(f"### Observation {i + 1}")
+
+                    st.write(f"**Date:** {obs.get('date', 'Unknown')}")
+                    st.write(f"**RA:** {obs.get('ra_deg', 'Unknown')}°")
+                    st.write(f"**Dec:** {obs.get('dec_deg', 'Unknown')}°")
+                    st.write(f"**Band:** {obs.get('band', 'Unknown')}")
+                    st.write(
+                        f"**Angular distance:** "
+                        f"{obs.get('distance', 0):.4f}°"
+                    )
+
+
+# =========================================================
+# MODE 2 : FREE EXPLORATION - STELLARIUM
+# =========================================================
+
+elif st.session_state.page == "exploration":
+
+    if st.button("← BACK TO HOME"):
+        go_home()
+        st.rerun()
+
+    st.markdown(
+        '<div class="main-title">Free Exploration</div>',
+        unsafe_allow_html=True
+    )
+
+    st.markdown("""
+    <div class="intro-box">
+        Explore the Universe through an interactive planetarium.
+        Navigate across the sky, discover stars, planets, galaxies
+        and constellations.
+    </div>
+    """, unsafe_allow_html=True)
+
+    st.markdown(
+        '<div class="section-title">Explore the Universe</div>',
+        unsafe_allow_html=True
+    )
+
+    # Stellarium Web embedded in Streamlit
+    st.components.v1.iframe(
+        "https://stellarium-web.org/",
+        height=780,
+        scrolling=True
+    )
+
+    st.markdown("""
+    <div class="info-box">
+        <b>How to explore:</b><br>
+        • Move around the sky to discover different regions.<br>
+        • Zoom in to observe stars and celestial objects.<br>
+        • Search for stars, planets, galaxies and constellations.<br>
+        • Select objects to access the information provided by Stellarium.
+    </div>
+    """, unsafe_allow_html=True)
+
+    st.markdown(
+        "[Open Stellarium Web in a separate tab](https://stellarium-web.org/)"
+    )

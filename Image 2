@@ -1,0 +1,152 @@
+import warnings
+from io import BytesIO
+
+import astropy.units as u
+import matplotlib.pyplot as plt
+import numpy as np
+import requests
+from astropy.coordinates import SkyCoord
+from astropy.io import fits
+from astroquery.ipac.irsa import Irsa
+
+
+# 1. Choix du même endroit du ciel
+endroit = SkyCoord(ra=10 * u.deg, dec=41 * u.deg)
+
+print("Je cherche les 2 images SPHEREx...")
+
+
+# 2. Utilise une liste de noms de collections possibles et essaie les plus probables.
+def find_first_image_url(collection_candidates):
+    last_error = None
+    for collection in collection_candidates:
+        try:
+            table = Irsa.query_sia(pos=(endroit, 1 * u.deg), collection=collection)
+            if len(table) == 0:
+                continue
+
+            access_url = table[0].get("access_url")
+            if access_url is None:
+                continue
+
+            return access_url
+
+        except Exception as exc:
+            last_error = exc
+            print(f"Collection '{collection}' invalide ou inaccessible: {exc}")
+            continue
+
+    if last_error is not None:
+        raise RuntimeError(
+            "Aucune collection SPHEREx compatible n'a pu être trouvée. "
+            f"Erreur la plus récente: {last_error}"
+        )
+
+    raise RuntimeError(
+        "Aucune image SPHEREx n'a été trouvée pour cette position. "
+        "Vérifie la zone et la disponibilité des données."
+    )
+
+
+candidate_dr1 = [
+    "spherex_dr1",
+    "spherex_dr1_images",
+    "spherex_dr1_coadds",
+    "spherex_dr1_image",
+]
+
+candidate_qr3 = [
+    "spherex_qr3",
+    "spherex_qr3_images",
+    "spherex_qr3_coadds",
+    "spherex_qr3_image",
+]
+
+try:
+    url1 = find_first_image_url(candidate_dr1)
+    url2 = find_first_image_url(candidate_qr3)
+except RuntimeError as exc:
+    raise SystemExit(str(exc))
+
+print(f"Image 1 trouvée : {url1}")
+print(f"Image 2 trouvée : {url2}")
+
+
+# 3. Fonction pour ouvrir un FITS depuis un lien sans le sauvegarder
+#    et renvoyer la matrice d'image 2D.
+def afficher_fits(url, titre):
+    response = requests.get(url, timeout=60)
+    response.raise_for_status()
+
+    with fits.open(BytesIO(response.content)) as hdul:
+        image_hdu = None
+        for hdu in hdul:
+            if getattr(hdu, "data", None) is not None and np.asarray(hdu.data).ndim == 2:
+                image_hdu = hdu
+                break
+
+        if image_hdu is None:
+            raise ValueError(f"Aucune donnée 2D trouvée dans le FITS pour : {url}")
+
+        img = np.asarray(image_hdu.data, dtype=np.float32)
+
+    plt.figure(figsize=(8, 7))
+    valid = np.isfinite(img)
+    if not np.any(valid):
+        raise ValueError(f"Image vide ou non finie pour : {url}")
+
+    vmin = np.percentile(img[valid], 5)
+    vmax = np.percentile(img[valid], 99.5)
+    plt.imshow(img, cmap="gray", vmin=vmin, vmax=vmax, origin="lower")
+    plt.colorbar(label="Valeur du pixel")
+    plt.title(titre)
+    plt.tight_layout()
+    plt.show()
+    return img
+
+
+# 4. On affiche les 2 images.
+print("Affichage produit 1...")
+img1 = afficher_fits(url1, "Produit SPHEREx 1 - DR1")
+
+print("Affichage produit 2...")
+img2 = afficher_fits(url2, "Produit SPHEREx 2 - QR3")
+
+# 5. Soustraction et recherche des objets qui ont bougé.
+print("Je fais la soustraction...")
+if img1.shape != img2.shape:
+    h = min(img1.shape[0], img2.shape[0])
+    w = min(img1.shape[1], img2.shape[1])
+    img1 = img1[:h, :w]
+    img2 = img2[:h, :w]
+
+img1 = np.asarray(img1, dtype=np.float64)
+img2 = np.asarray(img2, dtype=np.float64)
+diff = img2 - img1
+
+plt.figure(figsize=(8, 7))
+std = np.std(diff)
+if std == 0:
+    std = 1e-6
+
+plt.imshow(diff, cmap="seismic", vmin=-3 * std, vmax=3 * std, origin="lower")
+plt.colorbar(label="Différence")
+plt.title("SOUSTRACTION : Photo2 - Photo1 = Ce qui a bougé")
+plt.tight_layout()
+plt.show()
+
+# 6. Points qui ont bougé.
+seuil = 5 * std
+y, x = np.where(np.abs(diff) > seuil)
+print(f"J'ai trouvé {len(x)} points qui ont bougé !")
+print(f"Positions : {list(zip(x[:10], y[:10]))}")
+
+# Sauvegarde simple pour visualiser les résultats
+output_path = "moving_objects.csv"
+np.savetxt(output_path, np.column_stack((x, y)), delimiter=",", header="x,y", comments="")
+print(f"Fichier {output_path} créé.")
+
+# 7. Optional : on affiche un petit résumé pour vérifier si la détection est réaliste
+if len(x) > 0:
+    print("Exemple de détection de mouvement sur les coordonnées détectées.")
+    print("Le script est prêt à être lancé à nouveau avec une autre position si besoin.")
